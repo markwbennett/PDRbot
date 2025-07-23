@@ -126,4 +126,4 @@ dmypy.json
 .vscode/
 .idea/
 *.swp
-*.swo 
+*.swo opinions/
