@@ -147,21 +147,73 @@ class COAOpinionScraper:
         match = re.search(r'\d{2}-\d{2}-\d{5}-CR', case_link_text)
         return match.group(0) if match else None
     
-    def download_pdf(self, pdf_url, filename):
-        """Download PDF file"""
-        try:
-            response = self.session.get(pdf_url, timeout=30)
-            response.raise_for_status()
-            
-            filepath = os.path.join(self.output_dir, filename)
-            with open(filepath, 'wb') as f:
-                f.write(response.content)
-            
-            logger.info(f"Downloaded: {filename}")
-            return True
-        except Exception as e:
-            logger.error(f"Failed to download {filename}: {e}")
-            return False
+    def download_pdf(self, pdf_url, filename, max_retries=3):
+        """Download PDF file with retry logic"""
+        last_exception = None
+        filepath = os.path.join(self.output_dir, filename)
+        
+        for attempt in range(max_retries):
+            try:
+                response = self.session.get(pdf_url, timeout=30)
+                response.raise_for_status()
+                
+                # Validate response is actually a PDF
+                if response.headers.get('content-type', '').lower() != 'application/pdf':
+                    logger.warning(f"Response is not a PDF (attempt {attempt + 1}): {response.headers.get('content-type', 'unknown')}")
+                    if attempt == max_retries - 1:
+                        logger.error(f"Not a PDF after {max_retries} attempts: {filename}")
+                        return False
+                    time.sleep(2 ** attempt)  # Exponential backoff
+                    continue
+                
+                with open(filepath, 'wb') as f:
+                    f.write(response.content)
+                
+                # Verify file was written and has content
+                if os.path.exists(filepath) and os.path.getsize(filepath) > 0:
+                    # Basic PDF validation - check for PDF magic bytes
+                    with open(filepath, 'rb') as f:
+                        header = f.read(4)
+                        if not header.startswith(b'%PDF'):
+                            raise Exception("Downloaded file is not a valid PDF")
+                    
+                    logger.info(f"Downloaded: {filename}")
+                    return True
+                else:
+                    raise Exception("File was not written or is empty")
+                    
+            except (requests.exceptions.RequestException, requests.exceptions.Timeout, 
+                    requests.exceptions.ConnectionError, Exception) as e:
+                last_exception = e
+                if attempt < max_retries - 1:
+                    wait_time = 2 ** attempt  # Exponential backoff: 1, 2, 4 seconds
+                    logger.warning(f"Download failed (attempt {attempt + 1}/{max_retries}): {filename} - {e}. Retrying in {wait_time}s...")
+                    time.sleep(wait_time)
+                else:
+                    logger.error(f"Failed to download {filename} after {max_retries} attempts: {e}")
+        
+        return False
+    
+    def get_with_retry(self, url, max_retries=3):
+        """Make HTTP request with retry logic"""
+        last_exception = None
+        
+        for attempt in range(max_retries):
+            try:
+                response = self.session.get(url, timeout=30)
+                response.raise_for_status()
+                return response
+                
+            except (requests.exceptions.RequestException, requests.exceptions.Timeout, 
+                    requests.exceptions.ConnectionError) as e:
+                last_exception = e
+                if attempt < max_retries - 1:
+                    wait_time = 2 ** attempt  # Exponential backoff: 1, 2, 4 seconds
+                    logger.warning(f"Request failed (attempt {attempt + 1}/{max_retries}): {url} - {e}. Retrying in {wait_time}s...")
+                    time.sleep(wait_time)
+                else:
+                    logger.error(f"Failed to fetch {url} after {max_retries} attempts: {e}")
+                    raise last_exception
     
     def parse_criminal_causes(self, soup):
         """Parse the Criminal Causes Decided section"""
@@ -256,9 +308,7 @@ class COAOpinionScraper:
         logger.info(f"Scraping COA{coa_num:02d} for {date_str}")
         
         try:
-            response = self.session.get(url, timeout=30)
-            response.raise_for_status()
-            
+            response = self.get_with_retry(url)
             soup = BeautifulSoup(response.content, 'html.parser')
             criminal_cases = self.parse_criminal_causes(soup)
             

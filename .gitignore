@@ -126,4 +126,9 @@ dmypy.json
 .vscode/
 .idea/
 *.swp
-*.swo opinions/
+*.swo
+
+# Data directory (symlink)
+data/
+
+opinions/
