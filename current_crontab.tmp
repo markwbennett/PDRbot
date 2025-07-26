@@ -1,0 +1,1 @@
+1 12 * * 2-6 cd /home/mb/github/Scrape_COA_Opinions && ./run_daily_pdrbot.sh

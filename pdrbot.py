@@ -1502,36 +1502,134 @@ class PDRBot:
             logger.error(f"Report file not found: {report_path}")
             return False
         
+        # Get interesting issues count for the date
+        results = self.get_analysis_results(date_filter=target_date, interesting_only=True)
+        interesting_count = len(results)
+        
+        # Format the interesting issues text
+        if interesting_count == 0:
+            interesting_text = "no interesting issues"
+        elif interesting_count == 1:
+            interesting_text = "1 interesting issue"
+        else:
+            interesting_text = f"{interesting_count} interesting issues"
+        
         try:
-            # Create message
-            msg = MIMEMultipart()
-            msg['From'] = self.email_from
-            msg['To'] = ', '.join(all_recipients)  # Join all recipients
-            msg['Subject'] = f"{self.email_subject_prefix} - {target_date}"
+            # Send separate email to each recipient
+            successful_sends = 0
             
-            # Email body
-            body = f"""Daily PDRBot Report
+            for recipient in all_recipients:
+                try:
+                    # Create message for this recipient
+                    msg = MIMEMultipart()
+                    msg['From'] = self.email_from
+                    msg['To'] = recipient
+                    msg['Subject'] = f"{self.email_subject_prefix}—{target_date}—{interesting_text}"
+                    
+                    # Email body with unsubscribe text
+                    body = f"""Daily PDRBot Report
 
 Attached is the criminal law opinion analysis for {target_date}.
 
 This report contains AI-generated analysis of Texas Courts of Appeals criminal opinions for potential PDR worthiness.
 
 Report generated: {datetime.now().strftime("%B %d, %Y at %I:%M %p")}
+
+To unsubscribe reply 'unsubscribe'.
+"""
+                    
+                    msg.attach(MIMEText(body, 'plain'))
+                    
+                    # Attach PDF
+                    with open(report_path, "rb") as attachment:
+                        part = MIMEBase('application', 'octet-stream')
+                        part.set_payload(attachment.read())
+                        encoders.encode_base64(part)
+                        filename = os.path.basename(report_path)
+                        part.add_header(
+                            'Content-Disposition',
+                            f'attachment; filename= {filename}'
+                        )
+                        msg.attach(part)
+                    
+                    # Send email to this recipient
+                    if self.email_smtp_port == 465:
+                        # Use SSL for port 465
+                        server = smtplib.SMTP_SSL(self.email_smtp_host, self.email_smtp_port)
+                    else:
+                        # Use STARTTLS for port 587
+                        server = smtplib.SMTP(self.email_smtp_host, self.email_smtp_port)
+                        server.starttls()
+                    server.login(self.email_auth_user, self.email_password)
+                    text = msg.as_string()
+                    server.sendmail(self.email_from, [recipient], text)
+                    server.quit()
+                    
+                    logger.info(f"Email sent successfully to {recipient}")
+                    successful_sends += 1
+                    
+                except Exception as e:
+                    logger.error(f"Failed to send email to {recipient}: {e}")
+                    continue
+            
+            if successful_sends > 0:
+                logger.info(f"Successfully sent emails to {successful_sends} out of {len(all_recipients)} recipients")
+                return True
+            else:
+                logger.error("Failed to send email to any recipients")
+                return False
+            
+        except Exception as e:
+            logger.error(f"Failed to send emails: {e}")
+            return False
+
+    def send_test_email(self, recipient_email):
+        """Send a test email to a specific recipient"""
+        if not self.email_enabled:
+            logger.info("Email sending is disabled")
+            return False
+        
+        if not all([self.email_from, self.email_auth_user, self.email_password]):
+            logger.error("Email configuration incomplete")
+            return False
+        
+        # Use today's date for the test
+        target_date = datetime.now().strftime('%Y-%m-%d')
+        
+        # Get interesting issues count for today (or use 0 if none)
+        results = self.get_analysis_results(date_filter=target_date, interesting_only=True)
+        interesting_count = len(results)
+        
+        # Format the interesting issues text
+        if interesting_count == 0:
+            interesting_text = "no interesting issues"
+        elif interesting_count == 1:
+            interesting_text = "1 interesting issue"
+        else:
+            interesting_text = f"{interesting_count} interesting issues"
+        
+        try:
+            # Create test message
+            msg = MIMEMultipart()
+            msg['From'] = self.email_from
+            msg['To'] = recipient_email
+            msg['Subject'] = f"{self.email_subject_prefix}—{target_date}—{interesting_text} (TEST)"
+            
+            # Email body with unsubscribe text
+            body = f"""TEST EMAIL - Daily PDRBot Report
+
+This is a test email to verify the email functionality.
+
+Normally, this would contain the criminal law opinion analysis for {target_date}.
+
+This report contains AI-generated analysis of Texas Courts of Appeals criminal opinions for potential PDR worthiness.
+
+Report generated: {datetime.now().strftime("%B %d, %Y at %I:%M %p")}
+
+To unsubscribe reply 'unsubscribe'.
 """
             
             msg.attach(MIMEText(body, 'plain'))
-            
-            # Attach PDF
-            with open(report_path, "rb") as attachment:
-                part = MIMEBase('application', 'octet-stream')
-                part.set_payload(attachment.read())
-                encoders.encode_base64(part)
-                filename = os.path.basename(report_path)
-                part.add_header(
-                    'Content-Disposition',
-                    f'attachment; filename= {filename}'
-                )
-                msg.attach(part)
             
             # Send email
             if self.email_smtp_port == 465:
@@ -1543,16 +1641,16 @@ Report generated: {datetime.now().strftime("%B %d, %Y at %I:%M %p")}
                 server.starttls()
             server.login(self.email_auth_user, self.email_password)
             text = msg.as_string()
-            server.sendmail(self.email_from, all_recipients, text)  # sendmail accepts list of recipients
+            server.sendmail(self.email_from, [recipient_email], text)
             server.quit()
             
-            logger.info(f"Email sent successfully to {', '.join(all_recipients)}")
+            logger.info(f"Test email sent successfully to {recipient_email}")
             return True
             
         except Exception as e:
-            logger.error(f"Failed to send email: {e}")
+            logger.error(f"Failed to send test email to {recipient_email}: {e}")
             return False
-    
+
     def run_daily_automation(self, resume_run_id=None):
         """Run complete daily automation with resumption support"""
         target_date = self.get_previous_business_day()
@@ -2245,8 +2343,21 @@ def main():
                 print("✅ Subscription check completed")
             else:
                 print("❌ Subscription check failed")
+        elif command == "test-email":
+            # Send test email to specified recipient
+            if len(sys.argv) > 2:
+                recipient = sys.argv[2]
+                print(f"Sending test email to {recipient}...")
+                success = bot.send_test_email(recipient)
+                if success:
+                    print("✅ Test email sent successfully")
+                else:
+                    print("❌ Test email failed")
+            else:
+                print("Usage: python pdrbot.py test-email <email@address.com>")
+                sys.exit(1)
         else:
-            print("Usage: python pdrbot.py [scrape|analyze|both|report|daily-report|auto|resume|status|members|check-subscriptions|backfill-urls|analyze-dir] [options]")
+            print("Usage: python pdrbot.py [scrape|analyze|both|report|daily-report|auto|resume|status|members|check-subscriptions|test-email|backfill-urls|analyze-dir] [options]")
             print("  scrape       - Download new opinions only")
             print("  analyze      - Analyze unanalyzed opinions only")
             print("  both         - Download and analyze (default)")
@@ -2258,6 +2369,7 @@ def main():
             print("  status       - Show status of recent and incomplete runs")
             print("  members      - Show subscription members and recipients")
             print("  check-subscriptions - Manually check for subscription emails")
+            print("  test-email <email> - Send test email to specified recipient")
             print("  backfill-urls - Update existing records with direct PDF URLs")
             print("  analyze-dir <path> - Analyze all PDFs in specific directory")
             print("")
