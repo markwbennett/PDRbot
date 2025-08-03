@@ -96,6 +96,7 @@ class PDRBot:
         self.subscription_imap_host = os.getenv('SUBSCRIPTION_IMAP_HOST', 'imap.fastmail.com')
         self.subscription_imap_port = int(os.getenv('SUBSCRIPTION_IMAP_PORT', '993'))
         self.members_file = os.getenv('MEMBERS_FILE', 'data/members.json')
+        self.last_check_file = os.getenv('LAST_CHECK_FILE', 'data/last_subscription_check.txt')
         
         # Ensure data directory exists
         os.makedirs(data_dir, exist_ok=True)
@@ -1533,9 +1534,11 @@ Attached is the criminal law opinion analysis for {target_date}.
 
 This report contains AI-generated analysis of Texas Courts of Appeals criminal opinions for potential PDR worthiness.
 
+If you see an error in this report—especially if it misses what you think is an interesting issue—please email mb@ivi3.com.
+
 Report generated: {datetime.now().strftime("%B %d, %Y at %I:%M %p")}
 
-To unsubscribe reply 'unsubscribe'.
+To unsubscribe, reply with 'unsubscribe' as the first word of the subject or body.
 """
                     
                     msg.attach(MIMEText(body, 'plain'))
@@ -1624,9 +1627,11 @@ Normally, this would contain the criminal law opinion analysis for {target_date}
 
 This report contains AI-generated analysis of Texas Courts of Appeals criminal opinions for potential PDR worthiness.
 
+If you see an error in this report—especially if it misses what you think is an interesting issue—please email mb@ivi3.com.
+
 Report generated: {datetime.now().strftime("%B %d, %Y at %I:%M %p")}
 
-To unsubscribe reply 'unsubscribe'.
+To unsubscribe, reply with 'unsubscribe' as the first word of the subject or body.
 """
             
             msg.attach(MIMEText(body, 'plain'))
@@ -2042,6 +2047,36 @@ To unsubscribe reply 'unsubscribe'.
         
         return all_recipients
     
+    def get_last_subscription_check(self):
+        """Get the timestamp of the last subscription check"""
+        try:
+            if os.path.exists(self.last_check_file):
+                with open(self.last_check_file, 'r') as f:
+                    timestamp_str = f.read().strip()
+                    return datetime.fromisoformat(timestamp_str)
+            else:
+                # If no previous check, default to 7 days ago
+                return datetime.now() - timedelta(days=7)
+        except Exception as e:
+            logger.error(f"Error reading last check time: {e}")
+            # Fallback to 7 days ago
+            return datetime.now() - timedelta(days=7)
+    
+    def save_last_subscription_check(self, timestamp):
+        """Save the timestamp of the last subscription check"""
+        try:
+            # Ensure data directory exists
+            os.makedirs(os.path.dirname(self.last_check_file), exist_ok=True)
+            
+            with open(self.last_check_file, 'w') as f:
+                f.write(timestamp.isoformat())
+            
+            logger.info(f"Updated last subscription check time: {timestamp.isoformat()}")
+            return True
+        except Exception as e:
+            logger.error(f"Error saving last check time: {e}")
+            return False
+    
     def check_subscription_emails(self):
         """Check the subscription mailbox for subscribe/unsubscribe requests"""
         if not all([self.subscription_email, self.subscription_auth_user, self.subscription_password]):
@@ -2065,14 +2100,22 @@ To unsubscribe reply 'unsubscribe'.
                 mail.select('INBOX')
                 logger.info("Fallback to main INBOX folder for subscription emails")
             
-            # Search for unread emails
-            status, message_ids = mail.search(None, 'UNSEEN')
+            # Get last check time and search for emails since then
+            last_check = self.get_last_subscription_check()
+            current_time = datetime.now()
+            
+            # Format the date for IMAP search (DD-Mon-YYYY format)
+            since_date = last_check.strftime('%d-%b-%Y')
+            
+            # Search for emails since last check
+            status, message_ids = mail.search(None, f'SINCE {since_date}')
             
             if status != 'OK':
                 logger.error("Failed to search for emails")
                 return False
             
             message_ids = message_ids[0].split()
+            logger.info(f"Found {len(message_ids)} emails since last check ({last_check.strftime('%Y-%m-%d %H:%M:%S')})")
             processed_count = 0
             
             for msg_id in message_ids:
@@ -2084,6 +2127,19 @@ To unsubscribe reply 'unsubscribe'.
                     
                     # Parse email
                     email_message = email.message_from_bytes(msg_data[0][1])
+                    
+                    # Check if email date is actually after last check
+                    email_date_str = email_message.get('Date')
+                    if email_date_str:
+                        try:
+                            from email.utils import parsedate_to_datetime
+                            email_date = parsedate_to_datetime(email_date_str)
+                            # Only process emails that arrived after our last check
+                            if email_date <= last_check:
+                                continue
+                        except Exception:
+                            pass  # If we can't parse the date, process the email anyway
+                    
                     sender = email_message.get('From')
                     subject = email_message.get('Subject', '')
                     
@@ -2116,7 +2172,7 @@ To unsubscribe reply 'unsubscribe'.
                             logger.info(f"Processed unsubscription request from {sender_email} (via {source})")
                             processed_count += 1
                     
-                    # Mark as read
+                    # Mark as read to avoid reprocessing
                     mail.store(msg_id, '+FLAGS', '\\Seen')
                     
                 except Exception as e:
@@ -2125,6 +2181,9 @@ To unsubscribe reply 'unsubscribe'.
             
             mail.close()
             mail.logout()
+            
+            # Save the current time as the last check time
+            self.save_last_subscription_check(current_time)
             
             if processed_count > 0:
                 logger.info(f"Processed {processed_count} subscription requests")
@@ -2161,7 +2220,7 @@ To unsubscribe reply 'unsubscribe'.
 
 You will now receive daily criminal law opinion analysis reports from the Texas Courts of Appeals.
 
-To unsubscribe at any time, simply send an email to {self.subscription_email} with "unsubscribe" in the message body.
+To unsubscribe at any time, simply send an email to {self.subscription_email} with "unsubscribe" as the first word of the subject or body.
 
 PDRBot Team"""
             else:  # unsubscribed
@@ -2169,7 +2228,7 @@ PDRBot Team"""
 
 You will no longer receive daily criminal law opinion analysis reports.
 
-To resubscribe at any time, simply send an email to {self.subscription_email} with "subscribe" in the message body.
+To resubscribe at any time, simply send an email to {self.subscription_email} with "subscribe" as the first word of the subject or body.
 
 PDRBot Team"""
             
