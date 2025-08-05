@@ -1,1 +1,27 @@
-1 12 * * 2-6 cd /home/mb/github/Scrape_COA_Opinions && ./run_daily_pdrbot.sh
+# Personal automation and system maintenance crontab
+# Format: minute hour day month day-of-week command
+
+# === WORK AUTOMATION ===
+# Court opinion scraping - weekdays at 6:01 AM  
+1 6 * * 2-6 cd /home/mb/github/ubuntu-scrape-coa-opinions && ./run_daily_pdrbot.sh
+
+# Daily briefing generation - weekdays at 5:00 AM
+0 5 * * 1-5 cd /home/mb/github/DailyBriefing && ./scripts/run_briefing_with_review.sh
+
+# === NETWORK SERVICES ===
+# Load balancer IP update - every 30 minutes
+*/30 * * * * /home/mb/update_IP/update.sh
+
+# === SYSTEM MAINTENANCE ===
+# Update package lists - Sundays at 3:00 AM
+0 3 * * 0 apt update > /dev/null 2>&1
+
+# Remove unused packages - Mondays at 2:00 AM  
+0 2 * * 1 apt autoremove -y > /dev/null 2>&1
+
+# Clean old journal logs (30+ days) - 1st of each month at 1:00 AM
+0 1 1 * * journalctl --vacuum-time=30d > /dev/null 2>&1
+
+# Monitor disk space - daily at 6:00 AM (logs warning if >90% full)
+0 6 * * * df -h / | awk 'NR==2 && $5+0 > 90 {print "Disk space warning: " $5 " used on /"}' | logger -t diskcheck
+@reboot cd /home/mb/github/mini-find-Opinion-Drop-Times && ./start_monitor.sh start

@@ -14,11 +14,14 @@ LOG_FILE="data/pdrbot_cron.log"
 
 # Function to log with timestamp
 log_message() {
+    local message="$(date '+%Y-%m-%d %H:%M:%S') - $1"
+    # Output to terminal
+    echo "$message"
     # Try to create log file, fallback to local directory if data symlink is broken
-    if ! echo "$(date '+%Y-%m-%d %H:%M:%S') - $1" >> "$LOG_FILE" 2>/dev/null; then
+    if ! echo "$message" >> "$LOG_FILE" 2>/dev/null; then
         # Fallback to local log file if data directory is not accessible
         LOCAL_LOG="pdrbot_cron.log"
-        echo "$(date '+%Y-%m-%d %H:%M:%S') - $1" >> "$LOCAL_LOG"
+        echo "$message" >> "$LOCAL_LOG"
         # Update log file path for subsequent calls
         LOG_FILE="$LOCAL_LOG"
     fi
@@ -36,12 +39,13 @@ else
 fi
 
 # Run PDRBot automation
+log_message "Running PDRBot automation..."
 if [ -w "$(dirname "$LOG_FILE")" ] 2>/dev/null; then
-    ./.venv/bin/python pdrbot.py auto >> "$LOG_FILE" 2>&1
+    ./.venv/bin/python pdrbot.py auto 2>&1 | tee -a "$LOG_FILE"
 else
     # Fallback to local log if data directory not writable
     LOCAL_LOG="pdrbot_cron.log"
-    ./.venv/bin/python pdrbot.py auto >> "$LOCAL_LOG" 2>&1
+    ./.venv/bin/python pdrbot.py auto 2>&1 | tee -a "$LOCAL_LOG"
     LOG_FILE="$LOCAL_LOG"
 fi
 EXIT_CODE=$?
