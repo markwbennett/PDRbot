@@ -1,7 +1,7 @@
 #!/bin/bash
 
 # PDRBot Daily Automation Script
-# This script runs PDRBot daily automation at 12:01 AM
+# This script runs PDRBot daily automation at 9:10 AM
 
 # Set working directory to the script location
 cd "$(dirname "$0")"

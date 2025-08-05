@@ -56,7 +56,7 @@ The system identifies:
 ### Basic Commands
 
 ```bash
-# Download and analyze yesterday's opinions (default)
+# Download and analyze today's opinions (default)
 python pdrbot.py
 
 # Download opinions only
@@ -77,7 +77,7 @@ python pdrbot.py report
 # Generate report for specific date
 python pdrbot.py report 2025-07-24
 
-# Generate yesterday's daily report
+# Generate today's daily report
 python pdrbot.py daily-report
 
 # Update existing records with direct PDF URLs

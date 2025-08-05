@@ -142,6 +142,17 @@ class PDRBot:
             )
         ''')
         
+        # Create court_rollover table to track courts with no opinions for next day checking
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS court_rollover (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                court_number INTEGER NOT NULL,
+                original_date DATE NOT NULL,
+                created_timestamp TIMESTAMP DEFAULT (datetime('now', 'localtime')),
+                UNIQUE(court_number, original_date)
+            )
+        ''')
+        
         # Create analysis table
         cursor.execute('''
             CREATE TABLE IF NOT EXISTS analysis (
@@ -186,16 +197,53 @@ class PDRBot:
         conn.commit()
         conn.close()
     
-    def get_previous_business_day(self):
-        """Get the previous business day (skip weekends)"""
+    def get_current_business_day(self):
+        """Get the current business day (skip weekends)"""
         today = datetime.now().date()
-        yesterday = today - timedelta(days=1)
         
-        # If yesterday is weekend, go back to Friday
-        while yesterday.weekday() >= 5:  # Saturday=5, Sunday=6
-            yesterday -= timedelta(days=1)
+        # If today is weekend, go back to Friday
+        while today.weekday() >= 5:  # Saturday=5, Sunday=6
+            today -= timedelta(days=1)
         
-        return yesterday
+        return today
+    
+    def add_court_to_rollover(self, court_number, original_date):
+        """Add a court to rollover list for checking tomorrow"""
+        conn = sqlite3.connect(self.db_path)
+        cursor = conn.cursor()
+        try:
+            cursor.execute('''
+                INSERT OR IGNORE INTO court_rollover (court_number, original_date)
+                VALUES (?, ?)
+            ''', (court_number, original_date))
+            conn.commit()
+        except Exception as e:
+            logger.error(f"Failed to add court {court_number} to rollover: {e}")
+        finally:
+            conn.close()
+    
+    def get_rollover_courts(self, original_date):
+        """Get courts that need to be checked from previous day"""
+        conn = sqlite3.connect(self.db_path)
+        cursor = conn.cursor()
+        cursor.execute('''
+            SELECT court_number FROM court_rollover 
+            WHERE original_date = ?
+            ORDER BY court_number
+        ''', (original_date,))
+        results = [row[0] for row in cursor.fetchall()]
+        conn.close()
+        return results
+    
+    def clear_rollover_courts(self, original_date):
+        """Clear rollover courts for a specific date after processing"""
+        conn = sqlite3.connect(self.db_path)
+        cursor = conn.cursor()
+        cursor.execute('''
+            DELETE FROM court_rollover WHERE original_date = ?
+        ''', (original_date,))
+        conn.commit()
+        conn.close()
     
     def load_analysis_prompt(self):
         """Load the analysis prompt from the pdrbot-prompt file"""
@@ -977,7 +1025,7 @@ class PDRBot:
     def generate_daily_report(self, target_date=None):
         """Generate a report for a specific date"""
         if target_date is None:
-            target_date = self.get_previous_business_day()
+            target_date = self.get_current_business_day()
         
         # Convert datetime to string format for database comparison
         if hasattr(target_date, 'strftime'):
@@ -1411,14 +1459,20 @@ class PDRBot:
             return 0, 0
     
     def run_daily_scrape(self):
-        """Run daily scrape for the previous business day"""
-        target_date = self.get_previous_business_day()
+        """Run daily scrape for today's opinions and rollover courts from yesterday
+        
+        Checks today's opinions for all courts. Courts with no opinions are added
+        to rollover list for checking tomorrow. Also checks any rollover courts
+        from yesterday that had no opinions.
+        """
+        today = self.get_current_business_day()
+        yesterday = today - timedelta(days=1)
         run_date = datetime.now().date()
         
-        logger.info(f"Starting daily scrape for {target_date.strftime('%Y-%m-%d')}")
+        logger.info(f"Starting daily scrape for today ({today.strftime('%Y-%m-%d')}) with rollover from yesterday")
         
-        # Create date-based folder
-        date_folder = os.path.join(self.data_dir, target_date.strftime('%Y%m%d'))
+        # Create date-based folder for today
+        date_folder = os.path.join(self.data_dir, today.strftime('%Y%m%d'))
         os.makedirs(date_folder, exist_ok=True)
         
         # Initialize run record
@@ -1427,7 +1481,7 @@ class PDRBot:
         cursor.execute('''
             INSERT INTO daily_runs (run_date, target_date, status)
             VALUES (?, ?, 'running')
-        ''', (run_date, target_date))
+        ''', (run_date, today))
         run_id = cursor.lastrowid
         conn.commit()
         conn.close()
@@ -1435,17 +1489,45 @@ class PDRBot:
         total_cases = 0
         total_downloaded = 0
         courts_checked = 0
+        courts_with_no_opinions = []
         
         try:
-            # Scrape all 14 courts
+            # First, check rollover courts from yesterday
+            rollover_courts = self.get_rollover_courts(yesterday)
+            if rollover_courts:
+                logger.info(f"Checking {len(rollover_courts)} rollover courts from yesterday: {rollover_courts}")
+                for coa_num in rollover_courts:
+                    cases_found, files_downloaded = self.scrape_court_date(coa_num, yesterday, date_folder)
+                    total_cases += cases_found
+                    total_downloaded += files_downloaded
+                    courts_checked += 1
+                    
+                    # Small delay between courts
+                    time.sleep(int(os.getenv('COURT_DELAY', '2')))
+                
+                # Clear processed rollover courts
+                self.clear_rollover_courts(yesterday)
+            
+            # Now scrape all 14 courts for today
+            logger.info(f"Checking all courts for today's opinions ({today.strftime('%Y-%m-%d')})")
             for coa_num in range(1, 15):
-                cases_found, files_downloaded = self.scrape_court_date(coa_num, target_date, date_folder)
+                cases_found, files_downloaded = self.scrape_court_date(coa_num, today, date_folder)
                 total_cases += cases_found
                 total_downloaded += files_downloaded
                 courts_checked += 1
                 
+                # Track courts with no opinions for rollover
+                if cases_found == 0:
+                    courts_with_no_opinions.append(coa_num)
+                
                 # Small delay between courts
                 time.sleep(int(os.getenv('COURT_DELAY', '2')))
+            
+            # Add courts with no opinions to rollover for tomorrow
+            if courts_with_no_opinions:
+                logger.info(f"Adding {len(courts_with_no_opinions)} courts to rollover for tomorrow: {courts_with_no_opinions}")
+                for coa_num in courts_with_no_opinions:
+                    self.add_court_to_rollover(coa_num, today)
             
             # Update run record as completed
             conn = sqlite3.connect(self.db_path)
@@ -1528,7 +1610,9 @@ class PDRBot:
                     msg['Subject'] = f"{self.email_subject_prefix}—{target_date}—{interesting_text}"
                     
                     # Email body with unsubscribe text
-                    body = f"""Daily PDRBot Report
+                    body = f"""PDRBot has been modified to give you a report at 9:10 a.m., at which time all of the day's opinions will likely have been released. If a court releases opinions after 9:10 a.m., they will be in the next day's report.
+
+Daily PDRBot Report
 
 Attached is the criminal law opinion analysis for {target_date}.
 
@@ -1658,7 +1742,7 @@ To unsubscribe, reply with 'unsubscribe' as the first word of the subject or bod
 
     def run_daily_automation(self, resume_run_id=None):
         """Run complete daily automation with resumption support"""
-        target_date = self.get_previous_business_day()
+        target_date = self.get_current_business_day()
         date_str = target_date.strftime('%Y-%m-%d')
         
         # Check for incomplete runs first
@@ -1914,15 +1998,35 @@ To unsubscribe, reply with 'unsubscribe' as the first word of the subject or bod
         return results
     
     def resume_daily_scrape(self, run_id, target_date):
-        """Resume daily scrape with progress tracking"""
+        """Resume daily scrape with progress tracking
+        
+        Handles rollover courts from yesterday if resuming today's run,
+        then continues with regular court checking and rollover tracking.
+        """
+        today = self.get_current_business_day()
+        yesterday = today - timedelta(days=1)
         date_folder = os.path.join(self.data_dir, target_date.strftime('%Y%m%d'))
         os.makedirs(date_folder, exist_ok=True)
         
         courts_checked = 0
         total_cases = 0
         total_downloaded = 0
+        courts_with_no_opinions = []
         
         try:
+            # If resuming today's run, check rollover courts first
+            if target_date == today:
+                rollover_courts = self.get_rollover_courts(yesterday)
+                if rollover_courts:
+                    logger.info(f"Resuming: checking {len(rollover_courts)} rollover courts from yesterday")
+                    for coa_num in rollover_courts:
+                        cases_found, files_downloaded = self.scrape_court_date(coa_num, yesterday, date_folder)
+                        total_cases += cases_found
+                        total_downloaded += files_downloaded
+                        courts_checked += 1
+                        time.sleep(int(os.getenv('COURT_DELAY', '2')))
+                    self.clear_rollover_courts(yesterday)
+            
             for coa_num in range(1, 15):  # Courts 1-14
                 try:
                     courts_checked += 1
@@ -1936,6 +2040,10 @@ To unsubscribe, reply with 'unsubscribe' as the first word of the subject or bod
                     
                     total_cases += cases_found
                     total_downloaded += files_downloaded
+                    
+                    # Track courts with no opinions for rollover (only for today's date)
+                    if target_date == today and cases_found == 0:
+                        courts_with_no_opinions.append(coa_num)
                     
                     # Update progress
                     self.update_run_state(run_id, cases_found=total_cases, 
@@ -1952,6 +2060,12 @@ To unsubscribe, reply with 'unsubscribe' as the first word of the subject or bod
                 except Exception as e:
                     logger.error(f"Error scraping COA{coa_num:02d}: {e}")
                     continue
+            
+            # Add courts with no opinions to rollover for tomorrow (only for today's date)
+            if target_date == today and courts_with_no_opinions:
+                logger.info(f"Adding {len(courts_with_no_opinions)} courts to rollover for tomorrow: {courts_with_no_opinions}")
+                for coa_num in courts_with_no_opinions:
+                    self.add_court_to_rollover(coa_num, target_date)
             
             # Final update
             self.update_run_state(run_id, status='scrape_completed', 
@@ -2292,7 +2406,7 @@ def main():
             else:
                 print("No report generated (no interesting cases found)")
         elif command == "daily-report":
-            # Generate report for yesterday's analyses or specified date
+            # Generate report for today's analyses or specified date
             target_date = None
             if len(sys.argv) > 2:
                 date_str = sys.argv[2]
@@ -2422,7 +2536,7 @@ def main():
             print("  both         - Download and analyze (default)")
             print("  report       - Generate PDF report from all analyses")
             print("  report YYYY-MM-DD - Generate report for specific date")
-            print("  daily-report [YYYY-MM-DD] - Generate report for specified date or yesterday's analyses")
+            print("  daily-report [YYYY-MM-DD] - Generate report for specified date or today's analyses")
             print("  auto         - Full automation: scrape, analyze, report, and email")
             print("  resume [run_id] - Resume incomplete run or list incomplete runs")
             print("  status       - Show status of recent and incomplete runs")

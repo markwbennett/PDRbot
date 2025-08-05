@@ -2,8 +2,8 @@
 # Format: minute hour day month day-of-week command
 
 # === WORK AUTOMATION ===
-# Court opinion scraping - weekdays at 6:01 AM  
-1 6 * * 2-6 cd /home/mb/github/ubuntu-scrape-coa-opinions && ./run_daily_pdrbot.sh
+# Court opinion scraping - weekdays at 9:10 AM  
+10 9 * * 1-6 cd /home/mb/github/PDRbot && ./run_daily_pdrbot.sh
 
 # Daily briefing generation - weekdays at 5:00 AM
 0 5 * * 1-5 cd /home/mb/github/DailyBriefing && ./scripts/run_briefing_with_review.sh
