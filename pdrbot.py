@@ -1620,6 +1620,8 @@ This report contains AI-generated analysis of Texas Courts of Appeals criminal o
 
 If you see an error in this report—especially if it misses what you think is an interesting issue—please email mb@ivi3.com.
 
+PDRBot source code: https://github.com/markwbennett/PDRbot
+
 Report generated: {datetime.now().strftime("%B %d, %Y at %I:%M %p")}
 
 To unsubscribe, reply with 'unsubscribe' as the first word of the subject or body.
