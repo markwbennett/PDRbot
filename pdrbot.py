@@ -1610,7 +1610,7 @@ class PDRBot:
                     msg['Subject'] = f"{self.email_subject_prefix}—{target_date}—{interesting_text}"
                     
                     # Email body with unsubscribe text
-                    body = f"""PDRBot has been modified to give you a report at 9:10 a.m., at which time all of the day's opinions will likely have been released. If a court releases opinions after 9:10 a.m., they will be in the next day's report.
+                    body = f"""PDRBot produces a report at 9:10 a.m., at which time all of the day's opinions will likely have been released. If a court releases opinions after 9:10 a.m., they will be in the next day's report.
 
 Daily PDRBot Report
 
@@ -1621,6 +1621,8 @@ This report contains AI-generated analysis of Texas Courts of Appeals criminal o
 If you see an error in this report—especially if it misses what you think is an interesting issue—please email mb@ivi3.com.
 
 PDRBot source code: https://github.com/markwbennett/PDRbot
+
+The prompt used to produce this report is: {self.analysis_prompt}.
 
 Report generated: {datetime.now().strftime("%B %d, %Y at %I:%M %p")}
 
