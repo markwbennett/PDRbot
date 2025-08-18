@@ -1568,6 +1568,85 @@ class PDRBot:
             logger.error(f"Daily scrape failed: {e}")
             raise
 
+    def generate_prompt_pdf(self, target_date):
+        """Generate a PDF containing the analysis prompt"""
+        if not self.analysis_prompt:
+            logger.error("No analysis prompt available")
+            return None
+        
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        output_path = os.path.join(self.data_dir, f"pdrbot_prompt_{timestamp}.pdf")
+        
+        try:
+            # Create PDF document
+            doc = SimpleDocTemplate(output_path, pagesize=letter,
+                                  rightMargin=72, leftMargin=72, topMargin=72, bottomMargin=18)
+            
+            # Create custom styles
+            styles = getSampleStyleSheet()
+            styles.add(ParagraphStyle(
+                'CustomTitle',
+                parent=styles['Heading1'],
+                fontSize=16,
+                spaceAfter=30,
+                alignment=TA_CENTER,
+                textColor=colors.black
+            ))
+            styles.add(ParagraphStyle(
+                'PromptText',
+                parent=styles['Normal'],
+                fontSize=10,
+                spaceAfter=12,
+                alignment=TA_JUSTIFY,
+                textColor=colors.black,
+                fontName='Courier',
+                leading=12
+            ))
+            
+            story = []
+            
+            # Title
+            title = f"PDRBot Analysis Prompt"
+            story.append(Paragraph(title, styles['CustomTitle']))
+            story.append(Spacer(1, 20))
+            
+            # Date information
+            date_info = f"Report Date: {target_date}<br/>Generated: {datetime.now().strftime('%B %d, %Y at %I:%M %p')}"
+            story.append(Paragraph(date_info, styles['Normal']))
+            story.append(Spacer(1, 30))
+            
+            # Prompt content - split into paragraphs for better formatting
+            prompt_lines = self.analysis_prompt.split('\n')
+            current_paragraph = []
+            
+            for line in prompt_lines:
+                line = line.strip()
+                if not line:
+                    # Empty line - end current paragraph if it has content
+                    if current_paragraph:
+                        para_text = '<br/>'.join(current_paragraph)
+                        story.append(Paragraph(para_text, styles['PromptText']))
+                        story.append(Spacer(1, 6))
+                        current_paragraph = []
+                else:
+                    # Escape HTML characters and add to current paragraph
+                    escaped_line = line.replace('&', '&amp;').replace('<', '&lt;').replace('>', '&gt;')
+                    current_paragraph.append(escaped_line)
+            
+            # Add any remaining paragraph
+            if current_paragraph:
+                para_text = '<br/>'.join(current_paragraph)
+                story.append(Paragraph(para_text, styles['PromptText']))
+            
+            # Build PDF
+            doc.build(story)
+            logger.info(f"Prompt PDF generated: {output_path}")
+            return output_path
+            
+        except Exception as e:
+            logger.error(f"Error generating prompt PDF: {e}")
+            return None
+
     def send_email_report(self, report_path, target_date):
         """Send email with PDF report attachment"""
         if not self.email_enabled:
@@ -1597,6 +1676,9 @@ class PDRBot:
         else:
             interesting_text = f"{interesting_count} interesting issues"
         
+        # Generate prompt PDF
+        prompt_pdf_path = self.generate_prompt_pdf(target_date)
+        
         try:
             # Send separate email to each recipient
             successful_sends = 0
@@ -1622,7 +1704,7 @@ If you see an error in this report—especially if it misses what you think is a
 
 PDRBot source code: https://github.com/markwbennett/PDRbot
 
-The prompt used to produce this report is: {self.analysis_prompt}.
+The prompt used to produce this report is attached as a separate PDF.
 
 Report generated: {datetime.now().strftime("%B %d, %Y at %I:%M %p")}
 
@@ -1631,7 +1713,7 @@ To unsubscribe, reply with 'unsubscribe' as the first word of the subject or bod
                     
                     msg.attach(MIMEText(body, 'plain'))
                     
-                    # Attach PDF
+                    # Attach main report PDF
                     with open(report_path, "rb") as attachment:
                         part = MIMEBase('application', 'octet-stream')
                         part.set_payload(attachment.read())
@@ -1642,6 +1724,19 @@ To unsubscribe, reply with 'unsubscribe' as the first word of the subject or bod
                             f'attachment; filename= {filename}'
                         )
                         msg.attach(part)
+                    
+                    # Attach prompt PDF if generated successfully
+                    if prompt_pdf_path and os.path.exists(prompt_pdf_path):
+                        with open(prompt_pdf_path, "rb") as attachment:
+                            part = MIMEBase('application', 'octet-stream')
+                            part.set_payload(attachment.read())
+                            encoders.encode_base64(part)
+                            filename = os.path.basename(prompt_pdf_path)
+                            part.add_header(
+                                'Content-Disposition',
+                                f'attachment; filename= {filename}'
+                            )
+                            msg.attach(part)
                     
                     # Send email to this recipient
                     if self.email_smtp_port == 465:
@@ -1665,14 +1760,24 @@ To unsubscribe, reply with 'unsubscribe' as the first word of the subject or bod
             
             if successful_sends > 0:
                 logger.info(f"Successfully sent emails to {successful_sends} out of {len(all_recipients)} recipients")
-                return True
+                result = True
             else:
                 logger.error("Failed to send email to any recipients")
-                return False
-            
+                result = False
+                
         except Exception as e:
             logger.error(f"Failed to send emails: {e}")
-            return False
+            result = False
+        finally:
+            # Clean up temporary prompt PDF file
+            if prompt_pdf_path and os.path.exists(prompt_pdf_path):
+                try:
+                    os.remove(prompt_pdf_path)
+                    logger.debug(f"Cleaned up temporary prompt PDF: {prompt_pdf_path}")
+                except Exception as e:
+                    logger.warning(f"Failed to clean up prompt PDF {prompt_pdf_path}: {e}")
+        
+        return result
 
     def send_test_email(self, recipient_email):
         """Send a test email to a specific recipient"""
