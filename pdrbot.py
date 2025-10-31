@@ -21,8 +21,12 @@ from PyPDF2 import PdfReader, PdfWriter
 import io
 from pathlib import Path
 from dotenv import load_dotenv
-import subprocess
+import sys
 from reportlab.lib.pagesizes import letter, A4
+
+# Add mwb_common to path
+sys.path.insert(0, '/home/mb/github/mwb_common')
+from mwb_claude import call_claude_with_retry
 from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, PageBreak, Table, TableStyle
 from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
 from reportlab.lib.units import inch
@@ -261,72 +265,35 @@ class PDRBot:
             return None
     
     def analyze_opinion_with_claude(self, text_content, case_number):
-        """Send opinion text to Claude for analysis using CLI"""
+        """Send opinion text to Claude for analysis"""
         if not self.analysis_enabled:
             logger.warning("Analysis not enabled - skipping")
             return None
 
-        max_retries = 3
-        base_delay = 5  # Start with 5 seconds
+        try:
+            # Truncate extremely long texts to avoid timeout issues
+            max_content_length = 150000  # Approximately 150k characters
+            if len(text_content) > max_content_length:
+                logger.warning(f"Truncating large opinion {case_number} from {len(text_content)} to {max_content_length} characters")
+                text_content = text_content[:max_content_length] + "\n\n[CONTENT TRUNCATED DUE TO LENGTH]"
 
-        for attempt in range(max_retries + 1):
-            try:
-                # Truncate extremely long texts to avoid timeout issues
-                max_content_length = 150000  # Approximately 150k characters
-                if len(text_content) > max_content_length:
-                    logger.warning(f"Truncating large opinion {case_number} from {len(text_content)} to {max_content_length} characters")
-                    text_content = text_content[:max_content_length] + "\n\n[CONTENT TRUNCATED DUE TO LENGTH]"
+            # Prepare full prompt
+            full_prompt = f"{self.analysis_prompt}\n\n--- OPINION TEXT ---\n{text_content}"
 
-                # Prepare full prompt
-                full_prompt = f"{self.analysis_prompt}\n\n--- OPINION TEXT ---\n{text_content}"
+            # Use mwb_claude module with automatic fallback
+            analysis_text = call_claude_with_retry(
+                prompt=full_prompt,
+                timeout=180,
+                max_retries=3,
+                base_delay=5
+            )
 
-                # Create environment without ANTHROPIC_API_KEY to force Claude Max subscription usage
-                env = os.environ.copy()
-                env.pop('ANTHROPIC_API_KEY', None)
-                env.pop('CLAUDE_API_KEY', None)
+            logger.info(f"Completed analysis for {case_number}")
+            return analysis_text
 
-                # Use claude CLI with --print for non-interactive mode
-                result = subprocess.run(
-                    ['claude', '--print', '--dangerously-skip-permissions'],
-                    input=full_prompt,
-                    env=env,
-                    capture_output=True,
-                    text=True,
-                    timeout=180  # 3 minute timeout for long analyses
-                )
-
-                if result.returncode != 0:
-                    raise Exception(f"Claude CLI failed: {result.stderr}")
-
-                analysis_text = result.stdout.strip()
-                logger.info(f"Completed analysis for {case_number}")
-                return analysis_text
-
-            except subprocess.TimeoutExpired:
-                logger.error(f"Claude CLI timed out for {case_number}")
-                return None
-            except Exception as e:
-                error_str = str(e)
-
-                # Check if this is an overloaded error that we should retry
-                is_overloaded = (
-                    "overloaded_error" in error_str or
-                    "Overloaded" in error_str or
-                    "rate_limit" in error_str.lower() or
-                    "too_many_requests" in error_str.lower()
-                )
-
-                if is_overloaded and attempt < max_retries:
-                    delay = base_delay * (2 ** attempt)  # Exponential backoff: 5s, 10s, 20s
-                    logger.warning(f"Claude CLI overloaded for {case_number}, retrying in {delay} seconds (attempt {attempt + 1}/{max_retries})")
-                    time.sleep(delay)
-                    continue
-                else:
-                    logger.error(f"Failed to analyze {case_number} with Claude: {e}")
-                    return None
-
-        logger.error(f"Failed to analyze {case_number} after {max_retries} retries")
-        return None
+        except Exception as e:
+            logger.error(f"Failed to analyze {case_number} with Claude: {e}")
+            return None
     
     def save_analysis_to_db(self, opinion_id, case_number, court, opinion_date, analysis_text):
         """Save analysis results to database"""
