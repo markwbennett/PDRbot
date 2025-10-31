@@ -21,7 +21,7 @@ from PyPDF2 import PdfReader, PdfWriter
 import io
 from pathlib import Path
 from dotenv import load_dotenv
-import anthropic
+import subprocess
 from reportlab.lib.pagesizes import letter, A4
 from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, PageBreak, Table, TableStyle
 from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
@@ -55,16 +55,9 @@ class PDRBot:
             'User-Agent': os.getenv('USER_AGENT', 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36')
         })
         
-        # Claude API configuration
-        self.claude_api_key = os.getenv('CLAUDE_API_KEY')
-        self.claude_model = os.getenv('CLAUDE_MODEL', 'claude-3-5-sonnet-20250107')
-        self.claude_max_tokens = int(os.getenv('CLAUDE_MAX_TOKENS', '64000'))
+        # Claude CLI configuration
         self.analysis_enabled = os.getenv('ANALYSIS_ENABLED', 'true').lower() == 'true'
-        
-        # Initialize Claude client if API key is provided
-        self.claude_client = None
-        if self.claude_api_key and self.analysis_enabled:
-            self.claude_client = anthropic.Anthropic(api_key=self.claude_api_key)
+        logger.info("Using claude CLI with Max subscription for analysis")
         
         # Load analysis prompt
         self.analysis_prompt = self.load_analysis_prompt()
@@ -268,14 +261,14 @@ class PDRBot:
             return None
     
     def analyze_opinion_with_claude(self, text_content, case_number):
-        """Send opinion text to Claude for analysis"""
-        if not self.claude_client:
-            logger.warning("Claude client not initialized - skipping analysis")
+        """Send opinion text to Claude for analysis using CLI"""
+        if not self.analysis_enabled:
+            logger.warning("Analysis not enabled - skipping")
             return None
-        
+
         max_retries = 3
         base_delay = 5  # Start with 5 seconds
-        
+
         for attempt in range(max_retries + 1):
             try:
                 # Truncate extremely long texts to avoid timeout issues
@@ -283,43 +276,55 @@ class PDRBot:
                 if len(text_content) > max_content_length:
                     logger.warning(f"Truncating large opinion {case_number} from {len(text_content)} to {max_content_length} characters")
                     text_content = text_content[:max_content_length] + "\n\n[CONTENT TRUNCATED DUE TO LENGTH]"
-                
-                # Use streaming for potentially long requests
-                with self.claude_client.messages.stream(
-                    model=self.claude_model,
-                    max_tokens=self.claude_max_tokens,
-                    messages=[{
-                        "role": "user",
-                        "content": f"{self.analysis_prompt}\n\n--- OPINION TEXT ---\n{text_content}"
-                    }]
-                ) as stream:
-                    analysis_text = ""
-                    for text in stream.text_stream:
-                        analysis_text += text
-                
+
+                # Prepare full prompt
+                full_prompt = f"{self.analysis_prompt}\n\n--- OPINION TEXT ---\n{text_content}"
+
+                # Create environment without ANTHROPIC_API_KEY to force Claude Max subscription usage
+                env = os.environ.copy()
+                env.pop('ANTHROPIC_API_KEY', None)
+                env.pop('CLAUDE_API_KEY', None)
+
+                # Use claude CLI with --print for non-interactive mode
+                result = subprocess.run(
+                    ['claude', '--print', '--dangerously-skip-permissions'],
+                    input=full_prompt,
+                    env=env,
+                    capture_output=True,
+                    text=True,
+                    timeout=180  # 3 minute timeout for long analyses
+                )
+
+                if result.returncode != 0:
+                    raise Exception(f"Claude CLI failed: {result.stderr}")
+
+                analysis_text = result.stdout.strip()
                 logger.info(f"Completed analysis for {case_number}")
                 return analysis_text
-                
+
+            except subprocess.TimeoutExpired:
+                logger.error(f"Claude CLI timed out for {case_number}")
+                return None
             except Exception as e:
                 error_str = str(e)
-                
+
                 # Check if this is an overloaded error that we should retry
                 is_overloaded = (
-                    "overloaded_error" in error_str or 
+                    "overloaded_error" in error_str or
                     "Overloaded" in error_str or
                     "rate_limit" in error_str.lower() or
                     "too_many_requests" in error_str.lower()
                 )
-                
+
                 if is_overloaded and attempt < max_retries:
                     delay = base_delay * (2 ** attempt)  # Exponential backoff: 5s, 10s, 20s
-                    logger.warning(f"Claude API overloaded for {case_number}, retrying in {delay} seconds (attempt {attempt + 1}/{max_retries})")
+                    logger.warning(f"Claude CLI overloaded for {case_number}, retrying in {delay} seconds (attempt {attempt + 1}/{max_retries})")
                     time.sleep(delay)
                     continue
                 else:
                     logger.error(f"Failed to analyze {case_number} with Claude: {e}")
                     return None
-        
+
         logger.error(f"Failed to analyze {case_number} after {max_retries} retries")
         return None
     
@@ -341,7 +346,7 @@ class PDRBot:
                  has_interesting_issues, issue_count, claude_model)
                 VALUES (?, ?, ?, ?, ?, ?, ?, ?)
             ''', (opinion_id, case_number, court, opinion_date, analysis_text, 
-                  has_interesting_issues, issue_count, self.claude_model))
+                  has_interesting_issues, issue_count, 'claude-max'))
             
             conn.commit()
             return True
@@ -405,8 +410,8 @@ class PDRBot:
     
     def run_analysis_batch(self, limit=None):
         """Process unanalyzed opinions in batches"""
-        if not self.analysis_enabled or not self.claude_client:
-            logger.info("Analysis is disabled or Claude client not available")
+        if not self.analysis_enabled:
+            logger.info("Analysis is disabled")
             return
         
         unanalyzed = self.get_unanalyzed_opinions()
@@ -1887,7 +1892,7 @@ To unsubscribe, reply with 'unsubscribe' as the first word of the subject or bod
             self.resume_daily_scrape(run_id, target_date)
             
             # Step 2: Run analysis
-            if self.analysis_enabled and self.claude_client:
+            if self.analysis_enabled:
                 unanalyzed_count = len(self.get_unanalyzed_opinions_for_date(date_str))
                 if unanalyzed_count > 0:
                     logger.info(f"Step 2: Running analysis on {unanalyzed_count} cases...")
