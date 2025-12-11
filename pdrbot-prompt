@@ -18,8 +18,15 @@ REQUIRED LANGUAGE - USE THESE INSTEAD:
 ✅ "according to [case name]", "under [statute citation]", "the court noted"
 ✅ "the precedent from [case]", "the rule in [case]", "following [case]"
 
-🚨 ANY USE OF FORBIDDEN LANGUAGE WILL RESULT IN COMPLETE RESPONSE REJECTION 🚨
-🚨 EVERY SENTENCE MUST USE ONLY APPROVED DESCRIPTIVE LANGUAGE 🚨
+---
+
+OUTPUT FORMAT REQUIREMENT:
+Your response must contain ONLY the analysis report itself. Do NOT include:
+- Any acknowledgment of these instructions
+- Any compliance checklists or confirmations
+- Any meta-commentary about language requirements
+- Any preamble before "TERSE REPORT:" or "Appellant Name"
+Begin your response directly with "TERSE REPORT: INTERESTING LEGAL ISSUES" or "TERSE REPORT: NO INTERESTING ISSUES"
 
 ---
 

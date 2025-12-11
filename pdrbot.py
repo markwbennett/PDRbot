@@ -297,7 +297,7 @@ class PDRBot:
             return None
     
     def clean_analysis_text(self, analysis_text):
-        """Clean analysis text by removing introductory commentary and first-person statements"""
+        """Clean analysis text by removing introductory commentary, meta-commentary, and first-person statements"""
         import re
 
         # Remove common intro phrases and first-person commentary
@@ -320,6 +320,13 @@ class PDRBot:
             # "I find..." patterns at the beginning
             r"^I find (?:no interesting issues|that this).*?(?:\n|\.)\s*\n*",
             r"^I do not find.*?(?:\n|\.)\s*\n*",
+
+            # Meta-commentary about language requirements/compliance
+            r"^CRITICAL LANGUAGE REQUIREMENT.*?(?=TERSE REPORT|Appellant Name|\Z)",
+            r"^I have reviewed the forbidden words.*?(?:\n|\.)\s*\n*",
+            r"^.*compliance checklist.*?(?:\n\n|\Z)",
+            r"^.*COMPLIANCE CHECKLIST.*?(?:\n\n|\Z)",
+            r"^Every sentence will use only approved.*?(?:\n|\.)\s*\n*",
         ]
 
         cleaned = analysis_text
@@ -1804,25 +1811,34 @@ class PDRBot:
             logger.error(f"Error generating prompt PDF: {e}")
             return None
 
-    def send_email_report(self, report_path, target_date):
-        """Send email with PDF report attachment"""
+    def send_email_report(self, report_path, target_date, date_range=None):
+        """Send email with PDF report attachment
+
+        Args:
+            report_path: Path to the PDF report
+            target_date: Date string for subject line (can be a range like '2025-12-03 to 2025-12-09')
+            date_range: Optional tuple of (start_date, end_date) for querying results
+        """
         if not self.email_enabled:
             logger.info("Email sending is disabled")
             return False
-        
+
         # Get all recipients (static + dynamic members)
         all_recipients = self.get_all_recipients()
-        
+
         if not all([self.email_from, self.email_auth_user, self.email_password, report_path]) or not all_recipients:
             logger.error("Email configuration incomplete or no recipients")
             return False
-            
+
         if not os.path.exists(report_path):
             logger.error(f"Report file not found: {report_path}")
             return False
-        
-        # Get interesting issues count for the date
-        results = self.get_analysis_results(date_filter=target_date, interesting_only=True)
+
+        # Get interesting issues count for the date(s)
+        if date_range:
+            results = self.get_analysis_results(date_range=date_range, interesting_only=True)
+        else:
+            results = self.get_analysis_results(date_filter=target_date, interesting_only=True)
         interesting_count = len(results)
         
         # Format the interesting issues text
