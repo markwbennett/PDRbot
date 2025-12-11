@@ -26,7 +26,7 @@ from reportlab.lib.pagesizes import letter, A4
 
 # Add mwb_common to path
 sys.path.insert(0, '/home/mb/github/mwb_common')
-from mwb_claude import call_claude_with_retry
+from mwb_claude import call_claude_with_retry, get_current_model
 from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, PageBreak, Table, TableStyle
 from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
 from reportlab.lib.units import inch
@@ -61,7 +61,8 @@ class PDRBot:
         
         # Claude CLI configuration
         self.analysis_enabled = os.getenv('ANALYSIS_ENABLED', 'true').lower() == 'true'
-        logger.info("Using claude CLI with Max subscription for analysis")
+        self.claude_model = get_current_model()
+        logger.info(f"Using claude CLI with Max subscription for analysis (model: {self.claude_model})")
         
         # Load analysis prompt
         self.analysis_prompt = self.load_analysis_prompt()
@@ -295,26 +296,107 @@ class PDRBot:
             logger.error(f"Failed to analyze {case_number} with Claude: {e}")
             return None
     
+    def clean_analysis_text(self, analysis_text):
+        """Clean analysis text by removing introductory commentary and first-person statements"""
+        import re
+
+        # Remove common intro phrases and first-person commentary
+        # These patterns capture various ways Claude might introduce the analysis
+        intro_patterns = [
+            # "I'll/I will/Let me analyze..." patterns
+            r"^I'll analyze this.*?(?:\n|\.)\s*\n*",
+            r"^Let me analyze this.*?(?:\n|\.)\s*\n*",
+            r"^I will analyze this.*?(?:\n|\.)\s*\n*",
+            r"^I must analyze this.*?(?:\n|\.)\s*\n*",
+            r"^Analyzing this.*?(?:\n|\.)\s*\n*",
+
+            # "Looking at this..." patterns (single and multi-line)
+            r"^Looking at this.*?(?:\n\n|\*\*)",
+
+            # "I need to/I must examine/check..." patterns
+            r"^I need to (?:examine|check|analyze).*?(?:\n|\.)\s*\n*",
+            r"^I must (?:examine|check|analyze).*?(?:\n|\.)\s*\n*",
+
+            # "I find..." patterns at the beginning
+            r"^I find (?:no interesting issues|that this).*?(?:\n|\.)\s*\n*",
+            r"^I do not find.*?(?:\n|\.)\s*\n*",
+        ]
+
+        cleaned = analysis_text
+        for pattern in intro_patterns:
+            cleaned = re.sub(pattern, '', cleaned, flags=re.IGNORECASE | re.DOTALL)
+
+        # Remove leading whitespace/newlines
+        cleaned = cleaned.lstrip()
+
+        return cleaned
+
     def save_analysis_to_db(self, opinion_id, case_number, court, opinion_date, analysis_text):
-        """Save analysis results to database"""
+        """Save analysis results to database
+
+        For consolidated cases (multiple case numbers in same PDF), saves the
+        analysis to all opinion records that share the same file_path.
+        """
         conn = sqlite3.connect(self.db_path)
         cursor = conn.cursor()
-        
+
         try:
-            # Check if analysis contains interesting issues
-            has_interesting_issues = "no interesting issues" not in analysis_text.lower()
-            
-            # Count issues (rough estimate based on bullet points)
-            issue_count = analysis_text.count("▪ Issue Description:")
-            
-            cursor.execute('''
-                INSERT OR REPLACE INTO analysis 
-                (opinion_id, case_number, court, opinion_date, analysis_text, 
-                 has_interesting_issues, issue_count, claude_model)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-            ''', (opinion_id, case_number, court, opinion_date, analysis_text, 
-                  has_interesting_issues, issue_count, 'claude-max'))
-            
+            # Clean the analysis text
+            cleaned_text = self.clean_analysis_text(analysis_text)
+
+            # Check for execution errors
+            if "execution error" in cleaned_text.lower():
+                logger.warning(f"Analysis for {case_number} contains execution error - marking as failed")
+                has_interesting_issues = False
+                issue_count = 0
+            else:
+                # Check if analysis contains interesting issues
+                has_interesting_issues = "no interesting issues" not in cleaned_text.lower()
+
+                # Count issues - handle multiple format variations
+                import re
+                # Count patterns like "▪ Issue Description:", "**Issue Description:**", "Issue 1:", etc.
+                issue_patterns = [
+                    r'▪\s*Issue Description:',
+                    r'\*\*Issue Description:\*\*',
+                    r'\*\*Issue \d+:',
+                    r'Issue \d+:',
+                ]
+                issue_count = 0
+                for pattern in issue_patterns:
+                    count = len(re.findall(pattern, cleaned_text))
+                    issue_count = max(issue_count, count)  # Take the highest count from any pattern
+
+                # If issue_count is 0, mark as not interesting regardless of text content
+                if issue_count == 0:
+                    has_interesting_issues = False
+
+            # Get the file_path for this opinion
+            cursor.execute('SELECT file_path FROM opinions WHERE id = ?', (opinion_id,))
+            result = cursor.fetchone()
+            if not result:
+                logger.error(f"Opinion ID {opinion_id} not found")
+                return False
+
+            file_path = result[0]
+
+            # Find all opinion_ids that share this file_path (consolidated cases)
+            cursor.execute('SELECT id, case_number, court, opinion_date FROM opinions WHERE file_path = ?', (file_path,))
+            all_opinions = cursor.fetchall()
+
+            # Save analysis for all opinions that share this file
+            for oid, cnum, crt, odate in all_opinions:
+                cursor.execute('''
+                    INSERT OR REPLACE INTO analysis
+                    (opinion_id, case_number, court, opinion_date, analysis_text,
+                     has_interesting_issues, issue_count, claude_model)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                ''', (oid, cnum, crt, odate, cleaned_text,
+                      has_interesting_issues, issue_count, self.claude_model))
+
+            if len(all_opinions) > 1:
+                logger.info(f"Saved analysis to {len(all_opinions)} consolidated cases sharing {file_path}")
+
             conn.commit()
             return True
         except Exception as e:
@@ -324,16 +406,21 @@ class PDRBot:
             conn.close()
     
     def get_unanalyzed_opinions(self):
-        """Get opinions that haven't been analyzed yet"""
+        """Get opinions that haven't been analyzed yet
+
+        Returns only one opinion per unique file_path to avoid analyzing
+        the same PDF multiple times for consolidated cases.
+        """
         conn = sqlite3.connect(self.db_path)
         cursor = conn.cursor()
-        
+
         try:
             cursor.execute('''
-                SELECT o.id, o.case_number, o.court, o.opinion_date, o.file_path
+                SELECT MIN(o.id) as id, o.case_number, o.court, o.opinion_date, o.file_path
                 FROM opinions o
                 LEFT JOIN analysis a ON o.id = a.opinion_id
                 WHERE a.opinion_id IS NULL
+                GROUP BY o.file_path
                 ORDER BY o.opinion_date DESC, o.case_number
             ''')
             return cursor.fetchall()
@@ -568,39 +655,118 @@ class PDRBot:
         finally:
             conn.close()
     
-    def get_analysis_results(self, date_filter=None, interesting_only=True):
-        """Get analysis results for report generation"""
+    def get_analysis_results(self, date_filter=None, interesting_only=True, date_range=None):
+        """Get analysis results for report generation
+
+        Deduplicates by PDF content to ensure each unique PDF only appears once,
+        even if downloaded multiple times with different filenames (consolidated cases).
+
+        Args:
+            date_filter: Exact date match (str or datetime)
+            interesting_only: Only return cases with interesting issues
+            date_range: Tuple of (start_date, end_date) for range queries
+        """
+        import hashlib
         conn = sqlite3.connect(self.db_path)
         cursor = conn.cursor()
-        
+
         try:
+            # First get all matching results
             query = '''
-                SELECT a.case_number, a.court, a.opinion_date, a.analysis_text, 
+                SELECT a.case_number, a.court, a.opinion_date, a.analysis_text,
                        a.has_interesting_issues, a.issue_count, a.analysis_timestamp,
-                       o.file_path, o.case_url, o.pdf_url
+                       o.file_path, o.case_url, o.pdf_url, o.opinion_type
                 FROM analysis a
                 JOIN opinions o ON a.opinion_id = o.id
             '''
             params = []
-            
             conditions = []
-            
+
+            # Exclude very short analyses (likely failed/incomplete)
+            conditions.append("LENGTH(a.analysis_text) > 100")
+
+            # Filter to only interesting cases if requested
             if interesting_only:
                 conditions.append("a.has_interesting_issues = 1")
-            
+
             if date_filter:
-                # For daily reports, we want exact date matching
                 conditions.append("a.opinion_date = ?")
                 params.append(date_filter)
-            
+            elif date_range:
+                start_date, end_date = date_range
+                conditions.append("a.opinion_date >= ? AND a.opinion_date <= ?")
+                params.extend([start_date, end_date])
+
             if conditions:
                 query += " WHERE " + " AND ".join(conditions)
-            
-            # Order by interesting issues first, then by date and case number
+
             query += " ORDER BY a.has_interesting_issues DESC, a.opinion_date DESC, a.case_number"
-            
+
             cursor.execute(query, params)
-            return cursor.fetchall()
+            all_results = cursor.fetchall()
+
+            # Deduplicate by PDF content hash AND by consolidated case numbers
+            # But preserve different opinion types (lead vs concurring vs dissenting)
+            seen_hashes = {}
+            seen_case_sets = {}  # Track (case_numbers, opinion_type) to allow different opinion types
+            unique_results = []
+
+            for result in all_results:
+                file_path = result[7]  # file_path is at index 7
+                case_number = result[0]  # case_number is at index 0
+                opinion_type = result[10]  # opinion_type is at index 10
+
+                # Determine if this is a lead opinion or a side opinion (concurring/dissenting)
+                # Lead opinions: op, mem, combined, op+con, op+dis, mem+con, mem+dis, etc.
+                # We want to deduplicate lead opinions separately from side opinions
+                is_side_opinion = opinion_type in ('con', 'dis')
+
+                # Compute hash of PDF file
+                try:
+                    if os.path.exists(file_path):
+                        with open(file_path, 'rb') as f:
+                            pdf_content = f.read()
+                            pdf_hash = hashlib.md5(pdf_content).hexdigest()
+
+                        # Check if we've seen this exact PDF before
+                        if pdf_hash in seen_hashes:
+                            logger.debug(f"Skipping duplicate PDF: {file_path} (same as {seen_hashes[pdf_hash]})")
+                            continue
+
+                        # Extract case numbers from the first page to detect consolidated cases
+                        # that may have different PDF hashes but same content
+                        try:
+                            import subprocess
+                            text_result = subprocess.run(
+                                ['pdftotext', '-l', '1', file_path, '-'],
+                                capture_output=True, text=True, timeout=10
+                            )
+                            if text_result.returncode == 0:
+                                first_page = text_result.stdout
+                                # Find all case numbers in format XX-XX-XXXXX-CR
+                                import re
+                                case_nums = set(re.findall(r'\d{2}-\d{2}-\d{5}-CR', first_page))
+                                if case_nums:
+                                    # Create a key combining case numbers AND whether it's a side opinion
+                                    # This allows lead + concurring + dissenting to all appear
+                                    case_set_key = (frozenset(case_nums), is_side_opinion, opinion_type if is_side_opinion else 'lead')
+                                    if case_set_key in seen_case_sets:
+                                        logger.debug(f"Skipping consolidated duplicate: {case_number} [{opinion_type}] (same as {seen_case_sets[case_set_key]})")
+                                        continue
+                                    seen_case_sets[case_set_key] = case_number
+                        except Exception as e:
+                            logger.debug(f"Could not extract text from {file_path} for dedup: {e}")
+
+                        seen_hashes[pdf_hash] = file_path
+                        unique_results.append(result)
+                    else:
+                        # If file doesn't exist, include it anyway (will show error in report)
+                        unique_results.append(result)
+                except Exception as e:
+                    logger.warning(f"Error hashing {file_path}: {e}, including anyway")
+                    unique_results.append(result)
+
+            return unique_results
         except Exception as e:
             logger.error(f"Error fetching analysis results: {e}")
             return []
@@ -798,39 +964,56 @@ class PDRBot:
                 return new_filename
             counter += 1
     
-    def generate_analysis_report(self, date_filter=None, output_filename=None):
-        """Generate a comprehensive PDF report of analysis results"""
+    def generate_analysis_report(self, date_filter=None, output_filename=None, date_range=None, custom_title=None):
+        """Generate a comprehensive PDF report of analysis results
+
+        Args:
+            date_filter: Exact date for single-day reports
+            output_filename: Custom output filename
+            date_range: Tuple of (start_date, end_date) for multi-day reports
+            custom_title: Custom title for the report
+        """
         logger.info("Generating analysis PDF report...")
-        
-        # Get analysis results (include all cases, interesting first)
-        results = self.get_analysis_results(date_filter=date_filter, interesting_only=False)
-        
+
+        # Get analysis results (only interesting cases)
+        results = self.get_analysis_results(date_filter=date_filter, interesting_only=True, date_range=date_range)
+
         if not results:
             logger.info("No analyzed cases found for report generation")
             return None
-        
+
         # Determine the opinion date for the report title
         opinion_dates = [row[2] for row in results]  # opinion_date column
-        if date_filter:
+        if custom_title:
+            report_title = custom_title
+            report_date = "combined"
+        elif date_range:
+            start_date, end_date = date_range
+            report_title = f"{start_date} through {end_date} Handdowns"
+            report_date = f"{start_date.replace('-', '')}_to_{end_date.replace('-', '')}"
+        elif date_filter:
             # Handle both datetime objects and strings
             if hasattr(date_filter, 'strftime'):
                 report_date = date_filter.strftime("%Y-%m-%d")
             else:
                 report_date = str(date_filter)
+            report_title = f"{report_date} Handdowns"
         elif opinion_dates:
             # Use the most common date or latest date
             from collections import Counter
             date_counter = Counter(opinion_dates)
             most_common_date = date_counter.most_common(1)[0][0]
             report_date = str(most_common_date)
+            report_title = f"{report_date} Handdowns"
         else:
             report_date = datetime.now().strftime("%Y-%m-%d")
-        
+            report_title = f"{report_date} Handdowns"
+
         # Create output filename if not provided
         if not output_filename:
             base_filename = f"pdrbot_report_{report_date.replace('-', '')}.pdf"
             output_filename = self.get_unique_filename(base_filename)
-        
+
         output_path = os.path.join(self.data_dir, output_filename)
         
         # Create PDF document
@@ -848,7 +1031,7 @@ class PDRBot:
         story = []
         
         # Title with opinion date
-        title = Paragraph(f"PDRBot Report<br/>Interesting Legal Issues<br/>{report_date} Handdowns", styles['CustomTitle'])
+        title = Paragraph(f"PDRBot Report<br/>Interesting Legal Issues<br/>{report_title}", styles['CustomTitle'])
         story.append(title)
         story.append(Spacer(1, 20))
         
@@ -860,12 +1043,11 @@ class PDRBot:
         
         # Summary statistics
         total_cases = len(results)
-        interesting_cases = sum(1 for row in results if row[4])  # has_interesting_issues column
         total_issues = sum(row[5] for row in results)  # issue_count column
-        
+
         summary_data = [
-            ['Total Cases Analyzed:', str(total_cases)],
-            ['Cases with Interesting Issues:', str(interesting_cases)],
+            ['Cases with Interesting Issues:', str(total_cases)],
+            ['Total Issues Found:', str(total_issues)],
             ['Report Generated:', datetime.now().strftime("%B %d, %Y at %I:%M %p")],
         ]
         
@@ -879,25 +1061,10 @@ class PDRBot:
         
         story.append(summary_table)
         story.append(Spacer(1, 30))
-        
-        # Track when we switch from interesting to non-interesting cases
-        added_non_interesting_header = False
-        
-        # Process each case
-        for i, (case_number, court, opinion_date, analysis_text, has_interesting, 
-                issue_count, analysis_timestamp, file_path, case_url, pdf_url) in enumerate(results):
-            
-            # Add section header when we reach non-interesting cases
-            if not has_interesting and not added_non_interesting_header:
-                # Only add the header if we actually have non-interesting cases to show
-                remaining_cases = results[i:]
-                non_interesting_remaining = [r for r in remaining_cases if not r[4]]  # has_interesting column
-                if non_interesting_remaining:
-                    section_header = Paragraph("Cases with No Interesting Legal Issues", styles['CustomTitle'])
-                    story.append(PageBreak())
-                    story.append(section_header)
-                    story.append(Spacer(1, 20))
-                    added_non_interesting_header = True
+
+        # Process each case (all cases here are interesting since we filtered above)
+        for i, (case_number, court, opinion_date, analysis_text, has_interesting,
+                issue_count, analysis_timestamp, file_path, case_url, pdf_url, opinion_type) in enumerate(results):
             
             # Case title with links
             case_status = "⭐ " if has_interesting else ""
@@ -949,14 +1116,23 @@ class PDRBot:
             
             # Analysis text (clean up formatting for PDF)
             analysis_clean = analysis_text.replace('▪', '•').replace('◦', '○')
-            
+
             # Convert markdown formatting to HTML for PDF
             import re
+
             # Remove markdown headers (# and ##)
             analysis_clean = re.sub(r'^#+\s*', '', analysis_clean, flags=re.MULTILINE)
             # Remove Priority Level sections completely
             analysis_clean = re.sub(r'\*\*▪ Priority Level:\*\*[^\n]*\n?', '', analysis_clean)
             analysis_clean = re.sub(r'\*\*Priority Level:\*\*[^\n]*\n?', '', analysis_clean)
+
+            # Strip any existing HTML tags that Claude may have included
+            analysis_clean = re.sub(r'<[^>]+>', '', analysis_clean)
+
+            # Escape special HTML characters
+            analysis_clean = analysis_clean.replace('&', '&amp;').replace('<', '&lt;').replace('>', '&gt;')
+
+            # Now safely convert markdown to HTML
             # Convert **bold** to <b>bold</b>
             analysis_clean = re.sub(r'\*\*(.*?)\*\*', r'<b>\1</b>', analysis_clean)
             # Convert *italic* to <i>italic</i> (but not when part of **)
@@ -976,8 +1152,17 @@ class PDRBot:
             # Only add paragraphs if we have substantial content
             if valid_paragraphs:
                 for para_content in valid_paragraphs:
-                    story.append(Paragraph(para_content, styles['Analysis']))
-                    story.append(Spacer(1, 6))  # Small spacing between paragraphs
+                    try:
+                        story.append(Paragraph(para_content, styles['Analysis']))
+                        story.append(Spacer(1, 6))  # Small spacing between paragraphs
+                    except Exception as e:
+                        # If paragraph fails due to HTML parsing, try with plain text
+                        logger.warning(f"Paragraph HTML parsing failed for {case_number}, using plain text: {str(e)[:100]}")
+                        # Strip all markup and use plain text
+                        plain_content = re.sub(r'<[^>]+>', '', para_content)
+                        plain_content = plain_content.replace('&amp;', '&').replace('&lt;', '<').replace('&gt;', '>')
+                        story.append(Paragraph(plain_content, styles['Analysis']))
+                        story.append(Spacer(1, 6))
             
             # Add page break except for last case, and only if we added content
             if i < len(results) - 1:
@@ -1821,6 +2006,70 @@ To unsubscribe, reply with 'unsubscribe' as the first word of the subject or bod
             logger.error(f"Failed to send test email to {recipient_email}: {e}")
             return False
 
+    def check_execution_errors(self, date_str):
+        """Check for execution errors on a given date and return count"""
+        conn = sqlite3.connect(self.db_path)
+        cursor = conn.cursor()
+
+        cursor.execute('''
+            SELECT COUNT(*)
+            FROM analysis a
+            WHERE a.opinion_date = ? AND LOWER(a.analysis_text) LIKE '%execution error%'
+        ''', (date_str,))
+
+        count = cursor.fetchone()[0]
+        conn.close()
+        return count
+
+    def retry_execution_errors(self, date_str):
+        """Retry all cases with execution errors for a given date"""
+        conn = sqlite3.connect(self.db_path)
+        cursor = conn.cursor()
+
+        cursor.execute('''
+            SELECT o.id, o.case_number, o.court, o.opinion_date, o.file_path
+            FROM opinions o
+            JOIN analysis a ON o.id = a.opinion_id
+            WHERE a.opinion_date = ? AND LOWER(a.analysis_text) LIKE '%execution error%'
+        ''', (date_str,))
+
+        error_cases = cursor.fetchall()
+        conn.close()
+
+        if not error_cases:
+            return 0
+
+        logger.info(f"Retrying {len(error_cases)} cases with execution errors")
+        successful = 0
+
+        for opinion_id, case_number, court, opinion_date, file_path in error_cases:
+            logger.info(f"Retrying {case_number}...")
+
+            # Extract text
+            text_content = self.extract_text_from_pdf(file_path)
+            if not text_content:
+                logger.error(f"Failed to extract text from {file_path}")
+                continue
+
+            # Analyze
+            analysis_result = self.analyze_opinion_with_claude(text_content, case_number)
+
+            if not analysis_result or "execution error" in analysis_result.lower():
+                logger.warning(f"Still getting execution error for {case_number}")
+                continue
+
+            # Success! Save the new analysis
+            success = self.save_analysis_to_db(opinion_id, case_number, court, opinion_date, analysis_result)
+            if success:
+                logger.info(f"Successfully re-analyzed {case_number}")
+                successful += 1
+
+            # Rate limiting
+            time.sleep(2)
+
+        logger.info(f"Retry complete: {successful}/{len(error_cases)} successful")
+        return successful
+
     def run_daily_automation(self, resume_run_id=None):
         """Run complete daily automation with resumption support"""
         target_date = self.get_current_business_day()
@@ -1869,7 +2118,14 @@ To unsubscribe, reply with 'unsubscribe' as the first word of the subject or bod
                     logger.info("Step 2: No cases need analysis")
             else:
                 logger.warning("Analysis is disabled or Claude client not available")
-            
+
+            # Step 2.5: Check for and retry execution errors
+            logger.info("Step 2.5: Checking for execution errors...")
+            execution_errors = self.check_execution_errors(date_str)
+            if execution_errors > 0:
+                logger.warning(f"Found {execution_errors} execution errors - retrying...")
+                self.retry_execution_errors(date_str)
+
             # Step 3: Generate report
             logger.info("Step 3: Generating report...")
             self.update_run_state(run_id, status='reporting')
@@ -2062,18 +2318,23 @@ To unsubscribe, reply with 'unsubscribe' as the first word of the subject or bod
             return False
     
     def get_unanalyzed_opinions_for_date(self, target_date):
-        """Get unanalyzed opinions for a specific date"""
+        """Get unanalyzed opinions for a specific date
+
+        Returns only one opinion per unique file_path to avoid analyzing
+        the same PDF multiple times for consolidated cases.
+        """
         conn = sqlite3.connect(self.db_path)
         cursor = conn.cursor()
-        
+
         cursor.execute('''
-            SELECT o.id, o.case_number, o.court, o.opinion_date, o.file_path
+            SELECT MIN(o.id) as id, o.case_number, o.court, o.opinion_date, o.file_path
             FROM opinions o
             LEFT JOIN analysis a ON o.id = a.opinion_id
-            WHERE o.opinion_date = ? AND a.opinion_id IS NULL AND o.consolidated_with IS NULL
+            WHERE o.opinion_date = ? AND a.opinion_id IS NULL
+            GROUP BY o.file_path
             ORDER BY o.case_number
         ''', (target_date,))
-        
+
         results = cursor.fetchall()
         conn.close()
         return results
