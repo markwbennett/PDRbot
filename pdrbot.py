@@ -338,6 +338,47 @@ class PDRBot:
 
         return cleaned
 
+    def extract_headlines_from_analysis(self, analysis_text):
+        """Extract Headline field values from analysis text.
+
+        Handles multiple formatting variants:
+          ▪ Headline: ...
+          **Headline:** ...
+          Headline: ...
+
+        Returns a list of headline strings. Returns empty list for older
+        analyses that pre-date the Headline field (backward compatible).
+        """
+        patterns = [
+            r'▪\s*Headline:\s*(.+)',
+            r'\*\*Headline:\*\*\s*(.+)',
+            r'(?m)^Headline:\s*(.+)',
+        ]
+        headlines = []
+        for pattern in patterns:
+            matches = re.findall(pattern, analysis_text)
+            if matches:
+                headlines = [m.strip() for m in matches]
+                break
+        return headlines
+
+    def extract_appellant_name(self, analysis_text):
+        """Extract the appellant name / case style from the structured header.
+
+        Looks for the 'Appellant Name and Case Number' field in various
+        formatting variants and returns the value, or None if not found.
+        """
+        patterns = [
+            r'▪\s*Appellant Name[^:]*:\s*(.+)',
+            r'\*\*Appellant Name[^:]*:\*\*\s*(.+)',
+            r'(?m)^Appellant Name[^:]*:\s*(.+)',
+        ]
+        for pattern in patterns:
+            match = re.search(pattern, analysis_text)
+            if match:
+                return match.group(1).strip()
+        return None
+
     def save_analysis_to_db(self, opinion_id, case_number, court, opinion_date, analysis_text):
         """Save analysis results to database
 
@@ -368,6 +409,8 @@ class PDRBot:
                     r'\*\*Issue Description:\*\*',
                     r'\*\*Issue \d+:',
                     r'Issue \d+:',
+                    r'▪\s*Headline:',
+                    r'\*\*Headline:\*\*',
                 ]
                 issue_count = 0
                 for pattern in issue_patterns:
@@ -1849,13 +1892,37 @@ class PDRBot:
         else:
             interesting_text = f"{interesting_count} interesting issues"
         
+        # Build per-case summary lines for the email body
+        case_summary_lines = []
+        if interesting_count > 0:
+            for result in results:
+                case_number = result[0]
+                court = result[1]
+                analysis_text = result[3]
+                issue_count = result[5]
+
+                appellant_name = self.extract_appellant_name(analysis_text)
+                case_label = appellant_name if appellant_name else case_number
+                if court:
+                    case_label += f" ({court})"
+
+                headlines = self.extract_headlines_from_analysis(analysis_text)
+                if headlines:
+                    case_summary_lines.append(f"  {case_label}")
+                    for hl in headlines:
+                        case_summary_lines.append(f"    - {hl}")
+                else:
+                    # Old analysis without headlines — show case + issue count
+                    issue_word = "issue" if issue_count == 1 else "issues"
+                    case_summary_lines.append(f"  {case_label} — {issue_count} {issue_word}")
+
         # Generate prompt PDF
         prompt_pdf_path = self.generate_prompt_pdf(target_date)
-        
+
         try:
             # Send separate email to each recipient
             successful_sends = 0
-            
+
             for recipient in all_recipients:
                 try:
                     # Create message for this recipient
@@ -1863,15 +1930,21 @@ class PDRBot:
                     msg['From'] = self.email_from
                     msg['To'] = recipient
                     msg['Subject'] = f"{self.email_subject_prefix}—{target_date}—{interesting_text}"
-                    
-                    # Email body with unsubscribe text
+
+                    # Build email body with per-case summaries
+                    if interesting_count > 0:
+                        cases_section = f"{interesting_count} case(s) with interesting issues:\n\n"
+                        cases_section += "\n".join(case_summary_lines)
+                    else:
+                        cases_section = "No interesting issues were identified."
+
                     body = f"""PDRBot produces a report at 9:10 a.m., at which time all of the day's opinions will likely have been released. If a court releases opinions after 9:10 a.m., they will be in the next day's report.
 
-Daily PDRBot Report
+Daily PDRBot Report for {target_date}
 
-Attached is the criminal law opinion analysis for {target_date}.
+{cases_section}
 
-This report contains AI-generated analysis of Texas Courts of Appeals criminal opinions for potential PDR worthiness.
+Full analysis is in the attached PDF report.
 
 If you see an error in this report—especially if it misses what you think is an interesting issue—please email mb@ivi3.com.
 

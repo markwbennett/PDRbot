@@ -108,3 +108,4 @@ The application uses `.env` file for configuration:
 - `requirements.txt`: Python dependencies including anthropic, reportlab, beautifulsoup4
 - `run_daily_pdrbot.sh`: Daily automation script with logging and error handling
 - `.env`: Configuration file (not in repo) - contains Claude API key and email credentials
+- When debugging or developing (vs. in production, running through cron) default to sending email only to me, ask before senting email to entire list.

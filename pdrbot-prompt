@@ -36,6 +36,8 @@ Interesting legal issues are novel or controversial legal questions. If the law 
 
 ◦ Issues: If there are no interesting issues, just report "no interesting issues." If there are any, for each identified issue, provide the following structured information:
 
+▪ Headline: A single sentence (max 15 words) summarizing why this issue is PDR-worthy.
+
 ▪ Issue Description: A concise statement of the novel or controversial legal issue.
 
 ▪ Discussion of Issue: Include direct quotes or specific references (with bracketed source numbers) from the opinion(s) that illuminate the issue's controversial or novel nature, or that directly link the case to the issue. This should include references to how the court describes the issue as 'emerging,' 'unsettled,' a 'split among courts,' or similar language indicative of its status, for example, 'Neither the Court of Criminal Appeals nor our Court has decided that question' in the context of Franks hearings.
@@ -50,54 +52,6 @@ Interesting legal issues are novel or controversial legal questions. If the law 
 
 ▪ Issue Count: Total number of interesting issues identified
 
-PRIORITY ISSUE TYPES - Flag these as interesting regardless of other factors:
-▪ Texas Constitutional issues (article I, section x)
-▪ Constitutional violations (4th, 5th, 6th, 8th, 14th Amendment issues)
-▪ Statutory interpretation disputes
-▪ Jurisdictional questions
-▪ Evidence admissibility standards
+Use your judgment about what makes an issue PDR-worthy — that is, both interesting and important. Constitutional questions, unresolved splits among Texas courts, novel statutory interpretation, logical flaws in the court's reasoning, and reliance on aging or superseded authority are all things that could make an issue interesting and important -- but this is not an exhaustive list. Report what a skilled appellate criminal-defense lawyer would want to know about.
 
-PROCEDURAL ISSUES - Also identify:
-▪ Harmless error analysis problems
-▪ Standard of review misapplications
-▪ Preservation requirement inconsistencies
-▪ Appeal waiver enforcements that seem problematic
-
-CRITICAL REQUIREMENT - Outdated Precedent: Flag cases relying on:
-▪ Pre-2000 Court of Criminal Appeals precedent for any substantive legal question
-▪ Pre-1990 precedent for technology-related issues
-▪ Pre-2010 precedent for digital evidence/privacy issues
-▪ Any precedent that predates relevant statutory amendments
-You must carefully examine the publication years of ALL Court of Criminal Appeals decisions cited by the court when resolving each substantive legal issue. Even if the court treats the legal principle as settled, reliance on outdated authority indicates the issue may warrant further attention.
-
-CRITICAL REQUIREMENT - Logical Errors: Any case where the court's legal reasoning contains apparent logical inconsistencies, category errors, or problematic applications of legal principles must be classified as potentially interesting, even if the court treats the issue as routine. Specifically examine:
-
-▪ Category Errors: Where the court applies legal principles from one area of law to a different area without adequate justification (e.g., applying property law concepts to non-property offenses)
-
-▪ Internal Contradictions: Where the court acknowledges that certain legal requirements or elements are absent, then proceeds to apply rules that depend on those very requirements or elements
-
-▪ Bootstrapping: Where the court creates legal connections or elements that don't exist in the statute by drawing tenuous analogies or importing concepts from unrelated legal doctrines
-
-▪ Circular Reasoning: Where the court's conclusion depends on assumptions that aren't independently established
-
-▪ Burden Shifting Errors: Where courts improperly shift burdens of proof
-
-▪ Retroactivity Problems: Applying new legal standards to past conduct inappropriately
-
-▪ Factual vs Legal Determinations: Treating legal questions as factual or vice versa
-
-▪ Scope Creep: Expanding holdings beyond their proper boundaries
-
-When identifying logical errors as interesting issues, structure the report as follows:
-* Issue Description: Describe the logical flaw or inconsistency in the court's reasoning
-* Supporting Excerpts: Quote the contradictory or problematic passages that demonstrate the logical error
-* Analysis: Explain why the reasoning is logically flawed and what legal principles are misapplied
-
-VERIFICATION CHECKLIST - Before finalizing, confirm:
-▪ All Court of Criminal Appeals citations have publication years checked
-▪ All quotes are accurately attributed with page/paragraph references
-▪ Issue descriptions avoid conclusory language
-▪ Each issue clearly explains WHY it's novel/controversial (not just WHAT it is)
-▪ NO subjective adjectives or adverbs used (review entire response for compliance)
-▪ EVERY SENTENCE uses only approved descriptive language from the required list
-▪ NO forbidden words appear anywhere in the response (double-check against the forbidden list)
+Before responding, re-read your analysis to confirm: (1) no forbidden words appear, (2) every factual claim cites the opinion, and (3) each issue explains WHY it is novel or controversial.
