@@ -3,11 +3,20 @@
 # PDRBot Daily Automation Script
 # This script runs PDRBot daily automation at 9:10 AM
 
+set -o pipefail
+
 # Set working directory to the script location
 cd "$(dirname "$0")"
 
-# Set up environment
-export PATH="/usr/local/bin:/usr/bin:/bin:$PATH"
+# Set up environment — include ~/.local/bin for claude CLI
+export PATH="$HOME/.local/bin:/usr/local/bin:/usr/bin:/bin:$PATH"
+
+# Load .env for email credentials (used by send_failure_alert)
+if [ -f ".env" ]; then
+    set -a
+    source .env
+    set +a
+fi
 
 # Log file for cron job output
 LOG_FILE="data/pdrbot_cron.log"
@@ -27,7 +36,78 @@ log_message() {
     fi
 }
 
+# Send a failure alert email to mb@ivi3.com
+send_failure_alert() {
+    local subject="$1"
+    local body="$2"
+    local to="mb@ivi3.com"
+
+    if [ -z "$EMAIL_FROM" ] || [ -z "$EMAIL_PASSWORD" ]; then
+        log_message "WARNING: Cannot send failure alert — email credentials not configured"
+        return 1
+    fi
+
+    ALERT_SUBJECT="$subject" ALERT_BODY="$body" ALERT_TO="$to" \
+    ./.venv/bin/python -c "
+import os, smtplib
+from email.mime.text import MIMEText
+msg = MIMEText(os.environ['ALERT_BODY'])
+msg['Subject'] = os.environ['ALERT_SUBJECT']
+msg['From'] = os.environ['EMAIL_FROM']
+msg['To'] = os.environ['ALERT_TO']
+host = os.environ.get('EMAIL_SMTP_HOST', 'smtp.gmail.com')
+port = int(os.environ.get('EMAIL_SMTP_PORT', '587'))
+user = os.environ.get('EMAIL_AUTH_USER', os.environ['EMAIL_FROM'])
+pw = os.environ['EMAIL_PASSWORD']
+server = smtplib.SMTP(host, port)
+server.starttls()
+server.login(user, pw)
+server.sendmail(msg['From'], [msg['To']], msg.as_string())
+server.quit()
+" 2>/dev/null
+
+    if [ $? -eq 0 ]; then
+        log_message "Failure alert sent to $to"
+    else
+        log_message "WARNING: Failed to send alert email"
+    fi
+}
+
 log_message "Starting PDRBot daily automation"
+
+# Pre-flight: verify Claude CLI auth before running the full automation.
+# The OAuth token expires if no interactive Claude Code session has run
+# recently. A quick test call detects this early.
+AUTH_FAILED=false
+CLAUDE_BIN="$(which claude 2>/dev/null)"
+if [ -z "$CLAUDE_BIN" ]; then
+    log_message "WARNING: claude CLI not found in PATH"
+    AUTH_FAILED=true
+else
+    # Unset CLAUDECODE var so nested-session check doesn't block us
+    unset CLAUDECODE
+    AUTH_TEST=$(ANTHROPIC_API_KEY= CLAUDE_API_KEY= "$CLAUDE_BIN" --print "ping" 2>&1)
+    AUTH_RC=$?
+    if [ $AUTH_RC -ne 0 ] || [ -z "$AUTH_TEST" ]; then
+        log_message "ERROR: Claude CLI auth failed (rc=$AUTH_RC). OAuth token may be expired."
+        log_message "ERROR: Run an interactive 'claude' session to refresh credentials."
+        AUTH_FAILED=true
+    else
+        log_message "Claude CLI auth verified"
+    fi
+fi
+
+if [ "$AUTH_FAILED" = true ]; then
+    send_failure_alert \
+        "PDRBot: Claude CLI auth failed" \
+        "PDRBot cannot analyze opinions because the Claude CLI OAuth token has expired.
+
+Run an interactive 'claude' session on the server to refresh credentials.
+
+Time: $(date '+%Y-%m-%d %H:%M:%S')
+Host: $(hostname)"
+    # Continue anyway — scraping still works, analyses will queue for later.
+fi
 
 # Activate virtual environment and run automation
 if [ -f ".venv/bin/activate" ]; then
@@ -39,6 +119,8 @@ else
 fi
 
 # Run PDRBot automation
+# Use pipefail (set above) so $PIPESTATUS[0] / $? captures pdrbot's exit code
+# through the tee pipe.
 log_message "Running PDRBot automation..."
 if [ -w "$(dirname "$LOG_FILE")" ] 2>/dev/null; then
     ./.venv/bin/python pdrbot.py auto 2>&1 | tee -a "$LOG_FILE"
@@ -48,13 +130,24 @@ else
     ./.venv/bin/python pdrbot.py auto 2>&1 | tee -a "$LOCAL_LOG"
     LOG_FILE="$LOCAL_LOG"
 fi
-EXIT_CODE=$?
+EXIT_CODE=${PIPESTATUS[0]}
 
 if [ $EXIT_CODE -eq 0 ]; then
     log_message "PDRBot automation completed successfully"
 else
     log_message "PDRBot automation failed with exit code $EXIT_CODE"
+    send_failure_alert \
+        "PDRBot: daily automation failed (exit $EXIT_CODE)" \
+        "PDRBot daily automation exited with code $EXIT_CODE.
+
+Check the log: $(hostname):$(readlink -f "$LOG_FILE")
+
+Last 20 log lines:
+$(tail -20 "$LOG_FILE" 2>/dev/null || echo '(could not read log)')
+
+Time: $(date '+%Y-%m-%d %H:%M:%S')
+Host: $(hostname)"
 fi
 
 log_message "PDRBot daily automation finished"
-exit $EXIT_CODE 
+exit $EXIT_CODE

@@ -2216,25 +2216,50 @@ To unsubscribe, reply with 'unsubscribe' as the first word of the subject or bod
                 self.retry_execution_errors(date_str)
 
             # Step 3: Generate report
+            # First try a single-day report for the target date.  If that
+            # finds nothing (e.g. after a backlog catch-up where today's
+            # date has no interesting cases but earlier dates do), widen the
+            # window to cover all unreported dates since the last completed
+            # run.
             logger.info("Step 3: Generating report...")
             self.update_run_state(run_id, status='reporting')
             report_path = self.generate_daily_report(target_date)
-            
+            report_date_label = date_str
+            report_date_range = None
+
             if not report_path:
-                self.update_run_state(run_id, status='no_cases', 
+                # Check for unreported interesting cases on other dates
+                last_completed = self._get_last_completed_date()
+                if last_completed:
+                    range_start = (datetime.strptime(last_completed, '%Y-%m-%d').date()
+                                   + timedelta(days=1)).strftime('%Y-%m-%d')
+                else:
+                    range_start = date_str
+                range_end = date_str
+                if range_start < range_end:
+                    logger.info(f"No interesting cases for {date_str}; "
+                                f"trying range {range_start} to {range_end}")
+                    report_date_range = (range_start, range_end)
+                    report_path = self.generate_analysis_report(
+                        date_range=report_date_range)
+                    report_date_label = f"{range_start} to {range_end}"
+
+            if not report_path:
+                self.update_run_state(run_id, status='no_cases',
                                     error_message="No cases found for report")
                 logger.warning("No report generated (no cases found)")
                 return False
-            
+
             # Step 4: Check subscription emails
             logger.info("Step 4: Checking subscription emails...")
             self.check_subscription_emails()
-            
+
             # Step 5: Send email
             if self.email_enabled:
                 logger.info("Step 5: Sending email...")
                 self.update_run_state(run_id, status='emailing')
-                email_success = self.send_email_report(report_path, date_str)
+                email_success = self.send_email_report(
+                    report_path, report_date_label, date_range=report_date_range)
                 
                 if email_success:
                     self.update_run_state(run_id, status='completed')
@@ -2318,6 +2343,20 @@ To unsubscribe, reply with 'unsubscribe' as the first word of the subject or bod
         
         conn.close()
     
+    def _get_last_completed_date(self):
+        """Return the target_date of the most recent completed daily run, or None."""
+        conn = sqlite3.connect(self.db_path)
+        cursor = conn.cursor()
+        cursor.execute('''
+            SELECT target_date FROM daily_runs
+            WHERE status = 'completed'
+            ORDER BY target_date DESC
+            LIMIT 1
+        ''')
+        row = cursor.fetchone()
+        conn.close()
+        return str(row[0]) if row else None
+
     def find_incomplete_runs(self, target_date=None):
         """Find runs that were interrupted and can be resumed"""
         conn = sqlite3.connect(self.db_path)
