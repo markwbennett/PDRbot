@@ -11,36 +11,36 @@ import requests
 from bs4 import BeautifulSoup
 import os
 import re
-from datetime import datetime, timedelta
-from urllib.parse import urljoin
+import sys
+import json
 import time
 import logging
 import sqlite3
-import json
-from PyPDF2 import PdfReader, PdfWriter
-import io
+import smtplib
+import imaplib
+import email
+import hashlib
+from contextlib import contextmanager
+from datetime import datetime, timedelta
+from urllib.parse import urljoin, quote
 from pathlib import Path
+from PyPDF2 import PdfReader, PdfWriter
 from dotenv import load_dotenv
-import sys
-from reportlab.lib.pagesizes import letter, A4
-
-# Add mwb_common to path
-sys.path.insert(0, '/home/mb/github/mwb_common')
-from mwb_claude import call_claude_with_retry, get_current_model
+from email.mime.multipart import MIMEMultipart
+from email.mime.text import MIMEText
+from email.mime.base import MIMEBase
+from email import encoders
+from email.utils import parsedate_to_datetime
+from reportlab.lib.pagesizes import letter
 from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, PageBreak, Table, TableStyle
 from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
 from reportlab.lib.units import inch
 from reportlab.lib import colors
 from reportlab.lib.enums import TA_LEFT, TA_CENTER, TA_JUSTIFY
-from urllib.parse import quote
-import smtplib
-from email.mime.multipart import MIMEMultipart
-from email.mime.text import MIMEText
-from email.mime.base import MIMEBase
-from email import encoders
-import imaplib
-import email
-import json
+
+# Add mwb_common to path
+sys.path.insert(0, '/home/mb/github/mwb_common')
+from mwb_claude import call_claude_with_retry, get_current_model
 
 # Set up logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
@@ -184,13 +184,13 @@ class PDRBot:
             )
         ''')
 
-        # Add pdf_url column if it doesn't exist (for existing databases)
-        try:
-            cursor.execute('ALTER TABLE opinions ADD COLUMN pdf_url TEXT')
-            logger.info("Added pdf_url column to existing opinions table")
-        except sqlite3.OperationalError:
-            # Column already exists
-            pass
+        # Add columns if they don't exist (for existing databases)
+        for col, table in [('pdf_url', 'opinions'), ('pdr_score', 'analysis')]:
+            try:
+                cursor.execute(f'ALTER TABLE {table} ADD COLUMN {col} {"TEXT" if col == "pdf_url" else "INTEGER"}')
+                logger.info(f"Added {col} column to existing {table} table")
+            except sqlite3.OperationalError:
+                pass  # Column already exists
         
         conn.commit()
         conn.close()
@@ -252,6 +252,38 @@ class PDRBot:
             logger.warning("pdrbot-prompt file not found, using default prompt")
             return "Analyze this legal opinion for interesting legal issues."
     
+    @contextmanager
+    def smtp_connection(self):
+        """Context manager for SMTP connections"""
+        if self.email_smtp_port == 465:
+            server = smtplib.SMTP_SSL(self.email_smtp_host, self.email_smtp_port)
+        else:
+            server = smtplib.SMTP(self.email_smtp_host, self.email_smtp_port)
+            server.starttls()
+        server.login(self.email_auth_user, self.email_password)
+        try:
+            yield server
+        finally:
+            server.quit()
+
+    def extract_pdr_score(self, analysis_text):
+        """Extract PDR Score (1-10) from analysis text.
+
+        Returns an integer score, or None if not found/parseable.
+        """
+        patterns = [
+            r'▪\s*PDR Score[^:]*:\s*(\d+)',
+            r'\*\*PDR Score[^:]*:\*\*\s*(\d+)',
+            r'(?m)^PDR Score[^:]*:\s*(\d+)',
+        ]
+        for pattern in patterns:
+            match = re.search(pattern, analysis_text)
+            if match:
+                score = int(match.group(1))
+                if 1 <= score <= 10:
+                    return score
+        return None
+
     def extract_text_from_pdf(self, file_path):
         """Extract text content from a PDF file"""
         try:
@@ -398,12 +430,7 @@ class PDRBot:
                 has_interesting_issues = False
                 issue_count = 0
             else:
-                # Check if analysis contains interesting issues
-                has_interesting_issues = "no interesting issues" not in cleaned_text.lower()
-
                 # Count issues - handle multiple format variations
-                import re
-                # Count patterns like "▪ Issue Description:", "**Issue Description:**", "Issue 1:", etc.
                 issue_patterns = [
                     r'▪\s*Issue Description:',
                     r'\*\*Issue Description:\*\*',
@@ -415,11 +442,16 @@ class PDRBot:
                 issue_count = 0
                 for pattern in issue_patterns:
                     count = len(re.findall(pattern, cleaned_text))
-                    issue_count = max(issue_count, count)  # Take the highest count from any pattern
+                    issue_count = max(issue_count, count)
 
-                # If issue_count is 0, mark as not interesting regardless of text content
-                if issue_count == 0:
-                    has_interesting_issues = False
+                # Interesting = has structured issues AND doesn't say "no interesting issues"
+                has_interesting_issues = (
+                    issue_count > 0
+                    and "no interesting issues" not in cleaned_text.lower()
+                )
+
+            # Extract PDR score
+            pdr_score = self.extract_pdr_score(cleaned_text)
 
             # Get the file_path for this opinion
             cursor.execute('SELECT file_path FROM opinions WHERE id = ?', (opinion_id,))
@@ -439,10 +471,10 @@ class PDRBot:
                 cursor.execute('''
                     INSERT OR REPLACE INTO analysis
                     (opinion_id, case_number, court, opinion_date, analysis_text,
-                     has_interesting_issues, issue_count, claude_model)
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                     has_interesting_issues, issue_count, claude_model, pdr_score)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ''', (oid, cnum, crt, odate, cleaned_text,
-                      has_interesting_issues, issue_count, self.claude_model))
+                      has_interesting_issues, issue_count, self.claude_model, pdr_score))
 
             if len(all_opinions) > 1:
                 logger.info(f"Saved analysis to {len(all_opinions)} consolidated cases sharing {file_path}")
@@ -500,14 +532,16 @@ class PDRBot:
         success = self.save_analysis_to_db(opinion_id, case_number, court, opinion_date, analysis_result)
         if success:
             logger.info(f"Saved analysis for {case_number}")
-            
+
             # If case has interesting issues, scrape representative information
-            # Check the analysis text for interesting issues
-            has_interesting_issues = "no interesting issues" not in analysis_result.lower()
-            if has_interesting_issues:
+            # Use the cleaned/parsed result from DB to stay consistent
+            cleaned = self.clean_analysis_text(analysis_result)
+            issue_count = 0
+            for pattern in [r'▪\s*Headline:', r'\*\*Headline:\*\*']:
+                issue_count = max(issue_count, len(re.findall(pattern, cleaned)))
+            if issue_count > 0 and "no interesting issues" not in cleaned.lower():
                 case_url = self.generate_case_url(case_number, court)
                 self.scrape_case_representatives(case_url, case_number, court, opinion_date)
-                # Add small delay to be respectful to the website
                 time.sleep(1)
         
         return success
@@ -716,7 +750,6 @@ class PDRBot:
             interesting_only: Only return cases with interesting issues
             date_range: Tuple of (start_date, end_date) for range queries
         """
-        import hashlib
         conn = sqlite3.connect(self.db_path)
         cursor = conn.cursor()
 
@@ -725,7 +758,8 @@ class PDRBot:
             query = '''
                 SELECT a.case_number, a.court, a.opinion_date, a.analysis_text,
                        a.has_interesting_issues, a.issue_count, a.analysis_timestamp,
-                       o.file_path, o.case_url, o.pdf_url, o.opinion_type
+                       o.file_path, o.case_url, o.pdf_url, o.opinion_type,
+                       a.pdr_score
                 FROM analysis a
                 JOIN opinions o ON a.opinion_id = o.id
             '''
@@ -750,7 +784,7 @@ class PDRBot:
             if conditions:
                 query += " WHERE " + " AND ".join(conditions)
 
-            query += " ORDER BY a.has_interesting_issues DESC, a.opinion_date DESC, a.case_number"
+            query += " ORDER BY a.has_interesting_issues DESC, COALESCE(a.pdr_score, 0) DESC, a.opinion_date DESC, a.case_number"
 
             cursor.execute(query, params)
             all_results = cursor.fetchall()
@@ -793,8 +827,6 @@ class PDRBot:
                             )
                             if text_result.returncode == 0:
                                 first_page = text_result.stdout
-                                # Find all case numbers in format XX-XX-XXXXX-CR
-                                import re
                                 case_nums = set(re.findall(r'\d{2}-\d{2}-\d{5}-CR', first_page))
                                 if case_nums:
                                     # Create a key combining case numbers AND whether it's a side opinion
@@ -1050,7 +1082,7 @@ class PDRBot:
             report_title = f"{report_date} Handdowns"
         elif opinion_dates:
             # Use the most common date or latest date
-            from collections import Counter
+            from collections import Counter  # rare path, keep inline
             date_counter = Counter(opinion_dates)
             most_common_date = date_counter.most_common(1)[0][0]
             report_date = str(most_common_date)
@@ -1114,11 +1146,12 @@ class PDRBot:
 
         # Process each case (all cases here are interesting since we filtered above)
         for i, (case_number, court, opinion_date, analysis_text, has_interesting,
-                issue_count, analysis_timestamp, file_path, case_url, pdf_url, opinion_type) in enumerate(results):
+                issue_count, analysis_timestamp, file_path, case_url, pdf_url, opinion_type,
+                pdr_score) in enumerate(results):
             
-            # Case title with links
-            case_status = "⭐ " if has_interesting else ""
-            case_title = f"{case_status}Case {i+1}: {case_number} ({court})"
+            # Case title with PDR score
+            score_label = f" [PDR {pdr_score}/10]" if pdr_score else ""
+            case_title = f"Case {i+1}: {case_number} ({court}){score_label}"
             story.append(Paragraph(case_title, styles['CaseTitle']))
             
             # Case information with clickable links
@@ -1168,8 +1201,6 @@ class PDRBot:
             analysis_clean = analysis_text.replace('▪', '•').replace('◦', '○')
 
             # Convert markdown formatting to HTML for PDF
-            import re
-
             # Remove markdown headers (# and ##)
             analysis_clean = re.sub(r'^#+\s*', '', analysis_clean, flags=re.MULTILINE)
             # Remove Priority Level sections completely
@@ -1854,19 +1885,155 @@ class PDRBot:
             logger.error(f"Error generating prompt PDF: {e}")
             return None
 
+    def _build_email_html(self, target_date, results, interesting_count):
+        """Build HTML email body with case cards and direct links."""
+        # Build case cards
+        case_cards_html = ""
+        if interesting_count > 0:
+            for result in results:
+                case_number = result[0]
+                court = result[1]
+                analysis_text = result[3]
+                issue_count = result[5]
+                pdf_url = result[9]
+                pdr_score = result[11] if len(result) > 11 else None
+
+                appellant_name = self.extract_appellant_name(analysis_text)
+                case_label = appellant_name if appellant_name else case_number
+                headlines = self.extract_headlines_from_analysis(analysis_text)
+                case_url = self.generate_case_url(case_number, court)
+
+                # Score badge color
+                if pdr_score and pdr_score >= 8:
+                    badge_color = "#c0392b"  # red
+                elif pdr_score and pdr_score >= 6:
+                    badge_color = "#d68910"  # amber
+                elif pdr_score:
+                    badge_color = "#2874a6"  # blue
+                else:
+                    badge_color = "#7f8c8d"  # gray
+
+                score_badge = ""
+                if pdr_score:
+                    score_badge = (
+                        f'<span style="display:inline-block;background:{badge_color};'
+                        f'color:#fff;font-weight:bold;padding:2px 8px;border-radius:3px;'
+                        f'font-size:13px;margin-left:8px;">{pdr_score}/10</span>'
+                    )
+
+                headlines_html = ""
+                if headlines:
+                    items = "".join(
+                        f"<li style='margin:3px 0;color:#333;'>{hl}</li>"
+                        for hl in headlines
+                    )
+                    headlines_html = f"<ul style='margin:6px 0 0 0;padding-left:20px;'>{items}</ul>"
+                else:
+                    issue_word = "issue" if issue_count == 1 else "issues"
+                    headlines_html = f"<p style='margin:6px 0 0 0;color:#555;'>{issue_count} {issue_word}</p>"
+
+                # Direct PDF link if available
+                link_html = f'<a href="{case_url}" style="color:#2874a6;text-decoration:none;">Case page</a>'
+                if pdf_url and pdf_url.strip():
+                    first_pdf = pdf_url.split(';')[0]
+                    link_html += f' &middot; <a href="{first_pdf}" style="color:#2874a6;text-decoration:none;">Opinion PDF</a>'
+
+                case_cards_html += f"""
+                <tr><td style="padding:10px 16px;border-bottom:1px solid #eee;">
+                    <div style="font-size:15px;font-weight:bold;color:#1a1a1a;">
+                        {case_label} <span style="font-weight:normal;color:#666;">({court})</span>{score_badge}
+                    </div>
+                    {headlines_html}
+                    <div style="margin-top:4px;font-size:12px;">{link_html}</div>
+                </td></tr>"""
+
+        # Assemble full HTML
+        if interesting_count > 0:
+            summary_line = f"{interesting_count} case{'s' if interesting_count != 1 else ''} with interesting issues"
+        else:
+            summary_line = "No interesting issues identified"
+
+        html = f"""<!DOCTYPE html>
+<html><head><meta charset="utf-8"></head>
+<body style="margin:0;padding:0;font-family:-apple-system,Helvetica,Arial,sans-serif;background:#f5f5f5;">
+<table width="100%" cellpadding="0" cellspacing="0" style="max-width:600px;margin:0 auto;background:#ffffff;">
+    <tr><td style="background:#1a1a2e;padding:20px 24px;">
+        <div style="color:#ffffff;font-size:20px;font-weight:bold;">PDRBot Daily Report</div>
+        <div style="color:#aaa;font-size:14px;margin-top:4px;">{target_date}</div>
+    </td></tr>
+    <tr><td style="padding:16px 24px;background:#f8f8f8;border-bottom:1px solid #ddd;">
+        <div style="font-size:15px;color:#333;">{summary_line}</div>
+    </td></tr>
+    <tr><td style="padding:0;">
+        <table width="100%" cellpadding="0" cellspacing="0">
+            {case_cards_html}
+        </table>
+    </td></tr>
+    <tr><td style="padding:16px 24px;background:#f8f8f8;border-top:1px solid #ddd;font-size:12px;color:#888;">
+        Full analysis is in the attached PDF report.<br>
+        PDRBot runs at 9:10 a.m. Opinions released after that will appear in the next day's report.<br><br>
+        See an error? Email <a href="mailto:mb@ivi3.com" style="color:#2874a6;">mb@ivi3.com</a>.
+        &middot; <a href="https://github.com/markwbennett/PDRbot" style="color:#2874a6;">Source code</a><br><br>
+        To unsubscribe, reply with "unsubscribe" in the subject or body.
+    </td></tr>
+</table>
+</body></html>"""
+        return html
+
+    def _build_email_plain(self, target_date, results, interesting_count):
+        """Build plain-text fallback email body."""
+        if interesting_count > 0:
+            cases_section = f"{interesting_count} case(s) with interesting issues:\n\n"
+            for result in results:
+                case_number = result[0]
+                court = result[1]
+                analysis_text = result[3]
+                issue_count = result[5]
+                pdr_score = result[11] if len(result) > 11 else None
+
+                appellant_name = self.extract_appellant_name(analysis_text)
+                case_label = appellant_name if appellant_name else case_number
+                if court:
+                    case_label += f" ({court})"
+
+                score_str = f" [PDR {pdr_score}/10]" if pdr_score else ""
+                headlines = self.extract_headlines_from_analysis(analysis_text)
+                if headlines:
+                    cases_section += f"  {case_label}{score_str}\n"
+                    for hl in headlines:
+                        cases_section += f"    - {hl}\n"
+                else:
+                    issue_word = "issue" if issue_count == 1 else "issues"
+                    cases_section += f"  {case_label}{score_str} -- {issue_count} {issue_word}\n"
+                cases_section += "\n"
+        else:
+            cases_section = "No interesting issues were identified."
+
+        return f"""PDRBot Daily Report for {target_date}
+
+{cases_section}
+Full analysis is in the attached PDF report.
+
+PDRBot runs at 9:10 a.m. Opinions released after that will appear in the next day's report.
+
+See an error? Email mb@ivi3.com.
+Source: https://github.com/markwbennett/PDRbot
+
+To unsubscribe, reply with 'unsubscribe' in the subject or body.
+"""
+
     def send_email_report(self, report_path, target_date, date_range=None):
         """Send email with PDF report attachment
 
         Args:
             report_path: Path to the PDF report
-            target_date: Date string for subject line (can be a range like '2025-12-03 to 2025-12-09')
+            target_date: Date string for subject line
             date_range: Optional tuple of (start_date, end_date) for querying results
         """
         if not self.email_enabled:
             logger.info("Email sending is disabled")
             return False
 
-        # Get all recipients (static + dynamic members)
         all_recipients = self.get_all_recipients()
 
         if not all([self.email_from, self.email_auth_user, self.email_password, report_path]) or not all_recipients:
@@ -1877,220 +2044,119 @@ class PDRBot:
             logger.error(f"Report file not found: {report_path}")
             return False
 
-        # Get interesting issues count for the date(s)
+        # Get interesting issues for the date(s)
         if date_range:
             results = self.get_analysis_results(date_range=date_range, interesting_only=True)
         else:
             results = self.get_analysis_results(date_filter=target_date, interesting_only=True)
         interesting_count = len(results)
-        
-        # Format the interesting issues text
+
+        # Subject line
         if interesting_count == 0:
             interesting_text = "no interesting issues"
         elif interesting_count == 1:
-            interesting_text = "1 interesting issue"
+            interesting_text = "1 case"
         else:
-            interesting_text = f"{interesting_count} interesting issues"
-        
-        # Build per-case summary lines for the email body
-        case_summary_lines = []
-        if interesting_count > 0:
-            for result in results:
-                case_number = result[0]
-                court = result[1]
-                analysis_text = result[3]
-                issue_count = result[5]
+            interesting_text = f"{interesting_count} cases"
+        subject = f"{self.email_subject_prefix}\u2014{target_date}\u2014{interesting_text}"
 
-                appellant_name = self.extract_appellant_name(analysis_text)
-                case_label = appellant_name if appellant_name else case_number
-                if court:
-                    case_label += f" ({court})"
+        # Build email content
+        html_body = self._build_email_html(target_date, results, interesting_count)
+        plain_body = self._build_email_plain(target_date, results, interesting_count)
 
-                headlines = self.extract_headlines_from_analysis(analysis_text)
-                if headlines:
-                    case_summary_lines.append(f"  {case_label}")
-                    for hl in headlines:
-                        case_summary_lines.append(f"    - {hl}")
-                else:
-                    # Old analysis without headlines — show case + issue count
-                    issue_word = "issue" if issue_count == 1 else "issues"
-                    case_summary_lines.append(f"  {case_label} — {issue_count} {issue_word}")
-
-        # Generate prompt PDF
-        prompt_pdf_path = self.generate_prompt_pdf(target_date)
+        # Read report attachment once
+        with open(report_path, "rb") as f:
+            report_data = f.read()
+        report_filename = os.path.basename(report_path)
 
         try:
-            # Send separate email to each recipient
             successful_sends = 0
+            with self.smtp_connection() as server:
+                for recipient in all_recipients:
+                    try:
+                        msg = MIMEMultipart('alternative')
+                        msg['From'] = self.email_from
+                        msg['To'] = recipient
+                        msg['Subject'] = subject
 
-            for recipient in all_recipients:
-                try:
-                    # Create message for this recipient
-                    msg = MIMEMultipart()
-                    msg['From'] = self.email_from
-                    msg['To'] = recipient
-                    msg['Subject'] = f"{self.email_subject_prefix}—{target_date}—{interesting_text}"
+                        # Plain-text first, HTML second (clients prefer last)
+                        msg.attach(MIMEText(plain_body, 'plain'))
+                        msg.attach(MIMEText(html_body, 'html'))
 
-                    # Build email body with per-case summaries
-                    if interesting_count > 0:
-                        cases_section = f"{interesting_count} case(s) with interesting issues:\n\n"
-                        cases_section += "\n".join(case_summary_lines)
-                    else:
-                        cases_section = "No interesting issues were identified."
-
-                    body = f"""PDRBot produces a report at 9:10 a.m., at which time all of the day's opinions will likely have been released. If a court releases opinions after 9:10 a.m., they will be in the next day's report.
-
-Daily PDRBot Report for {target_date}
-
-{cases_section}
-
-Full analysis is in the attached PDF report.
-
-If you see an error in this report—especially if it misses what you think is an interesting issue—please email mb@ivi3.com.
-
-PDRBot source code: https://github.com/markwbennett/PDRbot
-
-The prompt used to produce this report is attached as a separate PDF.
-
-Report generated: {datetime.now().strftime("%B %d, %Y at %I:%M %p")}
-
-To unsubscribe, reply with 'unsubscribe' as the first word of the subject or body.
-"""
-                    
-                    msg.attach(MIMEText(body, 'plain'))
-                    
-                    # Attach main report PDF
-                    with open(report_path, "rb") as attachment:
+                        # Attach report PDF
                         part = MIMEBase('application', 'octet-stream')
-                        part.set_payload(attachment.read())
+                        part.set_payload(report_data)
                         encoders.encode_base64(part)
-                        filename = os.path.basename(report_path)
                         part.add_header(
                             'Content-Disposition',
-                            f'attachment; filename= {filename}'
+                            f'attachment; filename="{report_filename}"'
                         )
-                        msg.attach(part)
-                    
-                    # Attach prompt PDF if generated successfully
-                    if prompt_pdf_path and os.path.exists(prompt_pdf_path):
-                        with open(prompt_pdf_path, "rb") as attachment:
-                            part = MIMEBase('application', 'octet-stream')
-                            part.set_payload(attachment.read())
-                            encoders.encode_base64(part)
-                            filename = os.path.basename(prompt_pdf_path)
-                            part.add_header(
-                                'Content-Disposition',
-                                f'attachment; filename= {filename}'
-                            )
-                            msg.attach(part)
-                    
-                    # Send email to this recipient
-                    if self.email_smtp_port == 465:
-                        # Use SSL for port 465
-                        server = smtplib.SMTP_SSL(self.email_smtp_host, self.email_smtp_port)
-                    else:
-                        # Use STARTTLS for port 587
-                        server = smtplib.SMTP(self.email_smtp_host, self.email_smtp_port)
-                        server.starttls()
-                    server.login(self.email_auth_user, self.email_password)
-                    text = msg.as_string()
-                    server.sendmail(self.email_from, [recipient], text)
-                    server.quit()
-                    
-                    logger.info(f"Email sent successfully to {recipient}")
-                    successful_sends += 1
-                    
-                except Exception as e:
-                    logger.error(f"Failed to send email to {recipient}: {e}")
-                    continue
-            
+                        # Wrap in mixed to carry both alternative body and attachment
+                        outer = MIMEMultipart('mixed')
+                        outer['From'] = msg['From']
+                        outer['To'] = msg['To']
+                        outer['Subject'] = msg['Subject']
+                        outer.attach(msg)
+                        outer.attach(part)
+
+                        server.sendmail(self.email_from, [recipient], outer.as_string())
+                        logger.info(f"Email sent to {recipient}")
+                        successful_sends += 1
+
+                    except Exception as e:
+                        logger.error(f"Failed to send email to {recipient}: {e}")
+                        continue
+
             if successful_sends > 0:
-                logger.info(f"Successfully sent emails to {successful_sends} out of {len(all_recipients)} recipients")
-                result = True
+                logger.info(f"Sent emails to {successful_sends}/{len(all_recipients)} recipients")
+                return True
             else:
                 logger.error("Failed to send email to any recipients")
-                result = False
-                
+                return False
+
         except Exception as e:
             logger.error(f"Failed to send emails: {e}")
-            result = False
-        finally:
-            # Clean up temporary prompt PDF file
-            if prompt_pdf_path and os.path.exists(prompt_pdf_path):
-                try:
-                    os.remove(prompt_pdf_path)
-                    logger.debug(f"Cleaned up temporary prompt PDF: {prompt_pdf_path}")
-                except Exception as e:
-                    logger.warning(f"Failed to clean up prompt PDF {prompt_pdf_path}: {e}")
-        
-        return result
+            return False
 
     def send_test_email(self, recipient_email):
         """Send a test email to a specific recipient"""
         if not self.email_enabled:
             logger.info("Email sending is disabled")
             return False
-        
+
         if not all([self.email_from, self.email_auth_user, self.email_password]):
             logger.error("Email configuration incomplete")
             return False
-        
-        # Use today's date for the test
+
         target_date = datetime.now().strftime('%Y-%m-%d')
-        
-        # Get interesting issues count for today (or use 0 if none)
         results = self.get_analysis_results(date_filter=target_date, interesting_only=True)
         interesting_count = len(results)
-        
-        # Format the interesting issues text
+
         if interesting_count == 0:
             interesting_text = "no interesting issues"
         elif interesting_count == 1:
-            interesting_text = "1 interesting issue"
+            interesting_text = "1 case"
         else:
-            interesting_text = f"{interesting_count} interesting issues"
-        
+            interesting_text = f"{interesting_count} cases"
+
         try:
-            # Create test message
-            msg = MIMEMultipart()
+            msg = MIMEMultipart('alternative')
             msg['From'] = self.email_from
             msg['To'] = recipient_email
-            msg['Subject'] = f"{self.email_subject_prefix}—{target_date}—{interesting_text} (TEST)"
-            
-            # Email body with unsubscribe text
-            body = f"""TEST EMAIL - Daily PDRBot Report
+            msg['Subject'] = f"{self.email_subject_prefix}\u2014{target_date}\u2014{interesting_text} (TEST)"
 
-This is a test email to verify the email functionality.
+            plain_body = f"TEST EMAIL - PDRBot Daily Report for {target_date}\n\nThis is a test email to verify email functionality.\n\nTo unsubscribe, reply with 'unsubscribe' in the subject or body.\n"
+            html_body = self._build_email_html(target_date, results, interesting_count)
 
-Normally, this would contain the criminal law opinion analysis for {target_date}.
+            msg.attach(MIMEText(plain_body, 'plain'))
+            msg.attach(MIMEText(html_body, 'html'))
 
-This report contains AI-generated analysis of Texas Courts of Appeals criminal opinions for potential PDR worthiness.
+            with self.smtp_connection() as server:
+                server.sendmail(self.email_from, [recipient_email], msg.as_string())
 
-If you see an error in this report—especially if it misses what you think is an interesting issue—please email mb@ivi3.com.
-
-Report generated: {datetime.now().strftime("%B %d, %Y at %I:%M %p")}
-
-To unsubscribe, reply with 'unsubscribe' as the first word of the subject or body.
-"""
-            
-            msg.attach(MIMEText(body, 'plain'))
-            
-            # Send email
-            if self.email_smtp_port == 465:
-                # Use SSL for port 465
-                server = smtplib.SMTP_SSL(self.email_smtp_host, self.email_smtp_port)
-            else:
-                # Use STARTTLS for port 587
-                server = smtplib.SMTP(self.email_smtp_host, self.email_smtp_port)
-                server.starttls()
-            server.login(self.email_auth_user, self.email_password)
-            text = msg.as_string()
-            server.sendmail(self.email_from, [recipient_email], text)
-            server.quit()
-            
-            logger.info(f"Test email sent successfully to {recipient_email}")
+            logger.info(f"Test email sent to {recipient_email}")
             return True
-            
+
         except Exception as e:
             logger.error(f"Failed to send test email to {recipient_email}: {e}")
             return False
@@ -2716,7 +2782,6 @@ To unsubscribe, reply with 'unsubscribe' as the first word of the subject or bod
                     email_date_str = email_message.get('Date')
                     if email_date_str:
                         try:
-                            from email.utils import parsedate_to_datetime
                             email_date = parsedate_to_datetime(email_date_str)
                             # Only process emails that arrived after our last check
                             if email_date <= last_check:
@@ -2798,49 +2863,34 @@ To unsubscribe, reply with 'unsubscribe' as the first word of the subject or bod
             msg['From'] = self.email_from
             msg['To'] = recipient
             msg['Subject'] = f"PDRBot Subscription {action.title()}"
-            
+
             if action == 'subscribed':
-                body = f"""Thank you for subscribing to PDRBot daily reports!
+                body = f"""You are now subscribed to PDRBot daily reports.
 
-You will now receive daily criminal law opinion analysis reports from the Texas Courts of Appeals.
+You will receive daily criminal law opinion analysis reports from the Texas Courts of Appeals.
 
-To unsubscribe at any time, simply send an email to {self.subscription_email} with "unsubscribe" as the first word of the subject or body.
-
-PDRBot Team"""
-            else:  # unsubscribed
-                body = f"""You have been successfully unsubscribed from PDRBot daily reports.
-
-You will no longer receive daily criminal law opinion analysis reports.
-
-To resubscribe at any time, simply send an email to {self.subscription_email} with "subscribe" as the first word of the subject or body.
-
-PDRBot Team"""
-            
-            msg.attach(MIMEText(body, 'plain'))
-            
-            # Send confirmation
-            if self.email_smtp_port == 465:
-                server = smtplib.SMTP_SSL(self.email_smtp_host, self.email_smtp_port)
+To unsubscribe at any time, send an email to {self.subscription_email} with "unsubscribe" in the subject or body.
+"""
             else:
-                server = smtplib.SMTP(self.email_smtp_host, self.email_smtp_port)
-                server.starttls()
-            
-            server.login(self.email_auth_user, self.email_password)
-            server.sendmail(self.email_from, [recipient], msg.as_string())
-            server.quit()
-            
+                body = f"""You have been unsubscribed from PDRBot daily reports.
+
+To resubscribe at any time, send an email to {self.subscription_email} with "subscribe" in the subject or body.
+"""
+
+            msg.attach(MIMEText(body, 'plain'))
+
+            with self.smtp_connection() as server:
+                server.sendmail(self.email_from, [recipient], msg.as_string())
+
             logger.info(f"Sent {action} confirmation to {recipient}")
             return True
-            
+
         except Exception as e:
             logger.error(f"Error sending confirmation email to {recipient}: {e}")
             return False
 
 def main():
     """Main entry point for PDRBot"""
-    import sys
-    import sqlite3
-    
     bot = PDRBot()
     
     if len(sys.argv) > 1:
