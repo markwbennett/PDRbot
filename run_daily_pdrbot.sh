@@ -11,11 +11,24 @@ cd "$(dirname "$0")"
 # Set up environment — include ~/.local/bin for claude CLI
 export PATH="$HOME/.local/bin:/usr/local/bin:/usr/bin:/bin:$PATH"
 
-# Load .env for email credentials (used by send_failure_alert)
+# Load non-secret config from .env (secrets live in Doppler).
 if [ -f ".env" ]; then
     set -a
     source .env
     set +a
+fi
+
+# Export Doppler-managed credentials for this run.
+if command -v doppler >/dev/null 2>&1; then
+    DOPPLER_ENV="$(doppler secrets download --project shell-secrets --config dev --no-file --format env 2>/dev/null)"
+    if [ -n "$DOPPLER_ENV" ]; then
+        while IFS= read -r line; do
+            [ -z "$line" ] && continue
+            export "$line"
+        done <<< "$DOPPLER_ENV"
+    else
+        echo "WARNING: doppler secrets load returned empty; .env values only"
+    fi
 fi
 
 # Log file for cron job output
@@ -74,6 +87,15 @@ server.quit()
 }
 
 log_message "Starting PDRBot daily automation"
+
+# Snapshot the SQLite DB before any changes. Failure is non-fatal.
+if [ -x "scripts/backup_db.sh" ]; then
+    if ./scripts/backup_db.sh data/pdrbot.db 2>&1 | while IFS= read -r line; do log_message "$line"; done; then
+        :
+    else
+        log_message "WARNING: DB backup failed (continuing)"
+    fi
+fi
 
 # Pre-flight: verify Claude CLI auth before running the full automation.
 # The OAuth token expires if no interactive Claude Code session has run

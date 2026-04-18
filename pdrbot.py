@@ -10,6 +10,7 @@ Runs Tuesday-Saturday at 12:01 AM to collect opinions from the previous day.
 import requests
 from bs4 import BeautifulSoup
 import os
+import shutil
 import re
 import sys
 import json
@@ -45,6 +46,90 @@ from mwb_claude import call_claude_with_retry, get_current_model
 # Set up logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
+
+
+
+ANALYSIS_JSON_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "appellant_name": {
+            "type": "string",
+            "description": "Full name of the appellant as identified on page 1 of the opinion."
+        },
+        "case_numbers": {
+            "type": "array",
+            "items": {"type": "string"},
+            "description": "All COA cause numbers for the opinion(s) analyzed."
+        },
+        "issues": {
+            "type": "array",
+            "items": {
+                "type": "object",
+                "properties": {
+                    "headline": {"type": "string", "description": "One sentence, max 15 words, why the issue is PDR-worthy."},
+                    "issue_description": {"type": "string", "description": "The novel or controversial legal question."},
+                    "discussion": {"type": "string", "description": "Quotes or specific references from the opinion showing novelty or controversy."},
+                    "authority_conflicts": {"type": "string", "description": "Which courts take each side; whether the split is acknowledged; recency; CCA status. Empty string if none."},
+                    "relevant_precedent": {"type": "string", "description": "Other cases, statutes, or principles cited in the opinion that frame the controversy. Empty string if none."},
+                    "pdr_score": {"type": "integer", "minimum": 1, "maximum": 10, "description": "1-3 routine; 4-5 arguable; 6-7 unsettled; 8-10 split/unresolved-constitutional/logical-flaw."}
+                },
+                "required": ["headline", "issue_description", "discussion", "pdr_score"]
+            }
+        },
+        "issue_count": {"type": "integer", "minimum": 0}
+    },
+    "required": ["appellant_name", "case_numbers", "issues", "issue_count"]
+}
+
+
+def render_analysis_prose(text):
+    """Render analysis_text for display. Accepts either JSON (new) or prose
+    (legacy/stub). Returns a TERSE REPORT-formatted string."""
+    if not text:
+        return text
+    stripped = text.strip()
+    if not (stripped.startswith("{") and stripped.endswith("}")):
+        return text
+    try:
+        data = json.loads(stripped)
+    except ValueError:
+        return text
+    lines = []
+    count = data.get("issue_count", 0)
+    header = "TERSE REPORT: INTERESTING LEGAL ISSUES" if count else "TERSE REPORT: NO INTERESTING ISSUES"
+    lines.append(header)
+    lines.append("")
+    name = data.get("appellant_name", "")
+    nums = ", ".join(data.get("case_numbers", []) or [])
+    if name or nums:
+        lines.append(f"Appellant: {name}" + (f"  Case No.: {nums}" if nums else ""))
+        lines.append("")
+    for i, issue in enumerate(data.get("issues", []) or [], 1):
+        lines.append(f"Issue {i}:")
+        lines.append(f"  Headline: {issue.get('headline', '')}")
+        lines.append(f"  Description: {issue.get('issue_description', '')}")
+        lines.append(f"  Discussion: {issue.get('discussion', '')}")
+        if issue.get("authority_conflicts"):
+            lines.append(f"  Authority Conflicts: {issue['authority_conflicts']}")
+        if issue.get("relevant_precedent"):
+            lines.append(f"  Relevant Precedent: {issue['relevant_precedent']}")
+        lines.append(f"  PDR Score: {issue.get('pdr_score', 0)}")
+        lines.append("")
+    lines.append(f"Issue Count: {count}")
+    return "\n".join(lines)
+
+
+def parse_analysis_json(text):
+    """Return the structured dict if text is JSON; None if it is prose or invalid."""
+    if not text:
+        return None
+    stripped = text.strip()
+    if not (stripped.startswith("{") and stripped.endswith("}")):
+        return None
+    try:
+        return json.loads(stripped)
+    except ValueError:
+        return None
 
 class PDRBot:
     def __init__(self, data_dir="data"):
@@ -192,9 +277,38 @@ class PDRBot:
             except sqlite3.OperationalError:
                 pass  # Column already exists
         
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS imap_state (
+                mailbox TEXT PRIMARY KEY,
+                last_uid INTEGER DEFAULT 0,
+                updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+        ''')
+
         conn.commit()
         conn.close()
     
+    def _get_last_imap_uid(self, mailbox):
+        conn = sqlite3.connect(self.db_path)
+        cursor = conn.cursor()
+        cursor.execute('SELECT last_uid FROM imap_state WHERE mailbox = ?', (mailbox,))
+        row = cursor.fetchone()
+        conn.close()
+        return row[0] if row else 0
+
+    def _set_last_imap_uid(self, mailbox, uid):
+        conn = sqlite3.connect(self.db_path)
+        cursor = conn.cursor()
+        cursor.execute('''
+            INSERT INTO imap_state (mailbox, last_uid, updated_at)
+            VALUES (?, ?, CURRENT_TIMESTAMP)
+            ON CONFLICT(mailbox) DO UPDATE SET
+                last_uid = excluded.last_uid,
+                updated_at = CURRENT_TIMESTAMP
+        ''', (mailbox, uid))
+        conn.commit()
+        conn.close()
+
     def get_current_business_day(self):
         """Get the current business day (skip weekends)"""
         today = datetime.now().date()
@@ -271,6 +385,10 @@ class PDRBot:
 
         Returns an integer score, or None if not found/parseable.
         """
+        _d = parse_analysis_json(analysis_text)
+        if _d is not None:
+            scores = [i.get("pdr_score") for i in _d.get("issues", []) or [] if i.get("pdr_score")]
+            return max(scores) if scores else None
         patterns = [
             r'▪\s*PDR Score[^:]*:\s*(\d+)',
             r'\*\*PDR Score[^:]*:\*\*\s*(\d+)',
@@ -298,34 +416,87 @@ class PDRBot:
             return None
     
     def analyze_opinion_with_claude(self, text_content, case_number):
-        """Send opinion text to Claude for analysis"""
+        """Two-pass analysis: Haiku triage → Opus on hits.
+
+        Haiku 4.5 classifies the opinion as INTERESTING or ROUTINE. ROUTINE saves
+        a stub and skips the expensive pass; INTERESTING gets the full Opus pass.
+        Haiku failures fall through to Opus (safety — never drop a case silently).
+        """
         if not self.analysis_enabled:
             logger.warning("Analysis not enabled - skipping")
             return None
 
         try:
-            # Truncate extremely long texts to avoid timeout issues
-            max_content_length = 150000  # Approximately 150k characters
-            if len(text_content) > max_content_length:
-                logger.warning(f"Truncating large opinion {case_number} from {len(text_content)} to {max_content_length} characters")
-                text_content = text_content[:max_content_length] + "\n\n[CONTENT TRUNCATED DUE TO LENGTH]"
+            logger.info(f"Analyzing {case_number}: {len(text_content):,} chars")
 
-            # Prepare full prompt
+            triage_line = self._triage_with_haiku(text_content, case_number)
+            if triage_line and triage_line.upper().startswith("ROUTINE"):
+                logger.info(f"Triage {case_number}: {triage_line[:120]}")
+                return (
+                    "TERSE REPORT: NO INTERESTING ISSUES\n\n"
+                    f"[Triage: Haiku classified as ROUTINE. {triage_line}]"
+                )
+
+            if triage_line:
+                logger.info(f"Triage {case_number}: {triage_line[:120]}")
+            else:
+                logger.info(f"Triage {case_number}: unavailable — running full analysis")
+
             full_prompt = f"{self.analysis_prompt}\n\n--- OPINION TEXT ---\n{text_content}"
-
-            # Use mwb_claude module with automatic fallback
             analysis_text = call_claude_with_retry(
                 prompt=full_prompt,
-                timeout=180,
+                timeout=300,
                 max_retries=3,
-                base_delay=5
+                base_delay=5,
+                json_schema=ANALYSIS_JSON_SCHEMA,
             )
-
             logger.info(f"Completed analysis for {case_number}")
             return analysis_text
 
         except Exception as e:
             logger.error(f"Failed to analyze {case_number} with Claude: {e}")
+            return None
+
+    def _triage_with_haiku(self, text_content, case_number):
+        """Fast Haiku pass. Returns first line of the response, or None on
+        failure (caller falls through to full Opus pass)."""
+        triage_prompt = (
+            "You are a triage assistant for a Texas criminal-defense appellate "
+            "practice. You are deciding whether an opinion deserves a full "
+            "analysis pass.\n\n"
+            "Reply with exactly one line.\n\n"
+            "Write 'INTERESTING: <one-sentence reason>' if the opinion contains "
+            "any of:\n"
+            "- a novel or unsettled legal question\n"
+            "- a split among Texas courts (acknowledged or emerging)\n"
+            "- a constitutional question that is not clearly resolved\n"
+            "- reliance on pre-2000 Court of Criminal Appeals authority for a "
+            "contested point\n"
+            "- a demonstrable logical flaw in the court's reasoning that "
+            "affected the outcome\n\n"
+            "Write 'ROUTINE: <one-sentence reason>' if the opinion is a "
+            "fact-bound application of settled law with none of those "
+            "features.\n\n"
+            "Err on the side of INTERESTING when in doubt. A false ROUTINE "
+            "loses a PDR-worthy case; a false INTERESTING just costs one more "
+            "analysis call.\n\n"
+            "Your entire reply must be a single line starting with "
+            "'INTERESTING:' or 'ROUTINE:'."
+        )
+        try:
+            result = call_claude_with_retry(
+                prompt=f"{triage_prompt}\n\n--- OPINION TEXT ---\n{text_content}",
+                timeout=60,
+                max_retries=2,
+                base_delay=3,
+                model="claude-haiku-4-5",
+            )
+            if not result:
+                return None
+            return result.strip().splitlines()[0]
+        except Exception as e:
+            logger.warning(f"Haiku triage failed for {case_number}: {e} — "
+                           f"falling through to full analysis")
             return None
     
     def clean_analysis_text(self, analysis_text):
@@ -381,6 +552,9 @@ class PDRBot:
         Returns a list of headline strings. Returns empty list for older
         analyses that pre-date the Headline field (backward compatible).
         """
+        _d = parse_analysis_json(analysis_text)
+        if _d is not None:
+            return [i.get("headline", "") for i in _d.get("issues", []) or [] if i.get("headline")]
         patterns = [
             r'▪\s*Headline:\s*(.+)',
             r'\*\*Headline:\*\*\s*(.+)',
@@ -400,6 +574,9 @@ class PDRBot:
         Looks for the 'Appellant Name and Case Number' field in various
         formatting variants and returns the value, or None if not found.
         """
+        _d = parse_analysis_json(analysis_text)
+        if _d is not None:
+            return _d.get("appellant_name") or None
         patterns = [
             r'▪\s*Appellant Name[^:]*:\s*(.+)',
             r'\*\*Appellant Name[^:]*:\*\*\s*(.+)',
@@ -1198,7 +1375,7 @@ class PDRBot:
                     story.append(Spacer(1, 10))
             
             # Analysis text (clean up formatting for PDF)
-            analysis_clean = analysis_text.replace('▪', '•').replace('◦', '○')
+            analysis_clean = render_analysis_prose(analysis_text).replace('▪', '•').replace('◦', '○')
 
             # Convert markdown formatting to HTML for PDF
             # Remove markdown headers (# and ##)
@@ -1547,8 +1724,18 @@ class PDRBot:
             logger.info(f"Concatenating {len(temp_files)} opinions for case {case_number}")
             self.concatenate_pdfs(temp_files, final_filepath)
         elif len(temp_files) == 1:
-            # Single opinion - just rename the temp file
-            os.rename(temp_files[0], final_filepath)
+            src_path = temp_files[0]
+            if os.path.exists(final_filepath):
+                logger.info(f"Combined file already exists, dropping stale temp: {src_path}")
+                try:
+                    os.remove(src_path)
+                except OSError:
+                    pass
+                return 0
+            if not os.path.exists(src_path):
+                logger.error(f"Temp file vanished before rename: {src_path}")
+                return 0
+            shutil.move(src_path, final_filepath)
             temp_files = []  # Don't delete the file we just renamed
         else:
             logger.warning(f"No PDFs downloaded for case {case_number}")
@@ -1893,7 +2080,7 @@ class PDRBot:
             for result in results:
                 case_number = result[0]
                 court = result[1]
-                analysis_text = result[3]
+                analysis_text = render_analysis_prose(result[3])
                 issue_count = result[5]
                 pdf_url = result[9]
                 pdr_score = result[11] if len(result) > 11 else None
@@ -1987,7 +2174,7 @@ class PDRBot:
             for result in results:
                 case_number = result[0]
                 court = result[1]
-                analysis_text = result[3]
+                analysis_text = render_analysis_prose(result[3])
                 issue_count = result[5]
                 pdr_score = result[11] if len(result) > 11 else None
 
@@ -2036,13 +2223,15 @@ To unsubscribe, reply with 'unsubscribe' in the subject or body.
 
         all_recipients = self.get_all_recipients()
 
-        if not all([self.email_from, self.email_auth_user, self.email_password, report_path]) or not all_recipients:
+        if not all([self.email_from, self.email_auth_user, self.email_password]) or not all_recipients:
             logger.error("Email configuration incomplete or no recipients")
             return False
 
-        if not os.path.exists(report_path):
-            logger.error(f"Report file not found: {report_path}")
-            return False
+        # report_path may be None when PDF generation failed; we still send the
+        # inline HTML/plain body so subscribers see the analyses.
+        if report_path and not os.path.exists(report_path):
+            logger.error(f"Report file not found: {report_path}; sending without attachment")
+            report_path = None
 
         # Get interesting issues for the date(s)
         if date_range:
@@ -2051,7 +2240,7 @@ To unsubscribe, reply with 'unsubscribe' in the subject or body.
             results = self.get_analysis_results(date_filter=target_date, interesting_only=True)
         interesting_count = len(results)
 
-        # Subject line
+        # Subject line: show count + up to three top headlines.
         if interesting_count == 0:
             interesting_text = "no interesting issues"
         elif interesting_count == 1:
@@ -2060,14 +2249,31 @@ To unsubscribe, reply with 'unsubscribe' in the subject or body.
             interesting_text = f"{interesting_count} cases"
         subject = f"{self.email_subject_prefix}\u2014{target_date}\u2014{interesting_text}"
 
+        # Append up to three short headlines so the inbox preview carries signal.
+        if interesting_count > 0:
+            headlines = []
+            for r in results[:3]:
+                text = r[5] if len(r) > 5 else ""
+                extracted = self.extract_headlines_from_analysis(text) or []
+                if extracted:
+                    headlines.append(extracted[0])
+            if headlines:
+                trimmed = [h[:50].strip().rstrip(".") for h in headlines]
+                suffix = "; ".join(trimmed)
+                combined = f"{subject}: {suffix}"
+                subject = combined if len(combined) <= 180 else combined[:177] + "..."
+
         # Build email content
         html_body = self._build_email_html(target_date, results, interesting_count)
         plain_body = self._build_email_plain(target_date, results, interesting_count)
 
-        # Read report attachment once
-        with open(report_path, "rb") as f:
-            report_data = f.read()
-        report_filename = os.path.basename(report_path)
+        # Read report attachment once (may be absent if PDF generation failed).
+        report_data = None
+        report_filename = None
+        if report_path:
+            with open(report_path, "rb") as f:
+                report_data = f.read()
+            report_filename = os.path.basename(report_path)
 
         try:
             successful_sends = 0
@@ -2079,27 +2285,37 @@ To unsubscribe, reply with 'unsubscribe' in the subject or body.
                         msg['To'] = recipient
                         msg['Subject'] = subject
 
+                        # RFC 8058 one-click unsubscribe — required for Gmail/Yahoo deliverability.
+                        unsub_address = os.getenv('UNSUBSCRIBE_EMAIL', self.subscription_email or self.email_from)
+                        msg['List-Unsubscribe'] = f'<mailto:{unsub_address}?subject=unsubscribe>'
+                        msg['List-Unsubscribe-Post'] = 'List-Unsubscribe=One-Click'
+
                         # Plain-text first, HTML second (clients prefer last)
                         msg.attach(MIMEText(plain_body, 'plain'))
                         msg.attach(MIMEText(html_body, 'html'))
 
-                        # Attach report PDF
-                        part = MIMEBase('application', 'octet-stream')
-                        part.set_payload(report_data)
-                        encoders.encode_base64(part)
-                        part.add_header(
-                            'Content-Disposition',
-                            f'attachment; filename="{report_filename}"'
-                        )
-                        # Wrap in mixed to carry both alternative body and attachment
-                        outer = MIMEMultipart('mixed')
-                        outer['From'] = msg['From']
-                        outer['To'] = msg['To']
-                        outer['Subject'] = msg['Subject']
-                        outer.attach(msg)
-                        outer.attach(part)
+                        if report_data is not None:
+                            # Attach report PDF.
+                            part = MIMEBase('application', 'octet-stream')
+                            part.set_payload(report_data)
+                            encoders.encode_base64(part)
+                            part.add_header(
+                                'Content-Disposition',
+                                f'attachment; filename="{report_filename}"'
+                            )
+                            outer = MIMEMultipart('mixed')
+                            outer['From'] = msg['From']
+                            outer['To'] = msg['To']
+                            outer['Subject'] = msg['Subject']
+                            outer['List-Unsubscribe'] = msg['List-Unsubscribe']
+                            outer['List-Unsubscribe-Post'] = msg['List-Unsubscribe-Post']
+                            outer.attach(msg)
+                            outer.attach(part)
+                            envelope = outer
+                        else:
+                            envelope = msg
 
-                        server.sendmail(self.email_from, [recipient], outer.as_string())
+                        server.sendmail(self.email_from, [recipient], envelope.as_string())
                         logger.info(f"Email sent to {recipient}")
                         successful_sends += 1
 
@@ -2225,6 +2441,100 @@ To unsubscribe, reply with 'unsubscribe' in the subject or body.
         logger.info(f"Retry complete: {successful}/{len(error_cases)} successful")
         return successful
 
+    def check_court_staleness(self, threshold_days=21):
+        """Return per-court list of (court, days_since_last_interesting). Any
+        court past threshold_days is flagged stale — usually a scraper regression.
+        Returns a list of dicts; empty if all courts are current or have no history."""
+        conn = sqlite3.connect(self.db_path)
+        cursor = conn.cursor()
+        cursor.execute("""
+            SELECT o.court,
+                   MAX(o.opinion_date) AS last_interesting,
+                   JULIANDAY('now') - JULIANDAY(MAX(o.opinion_date)) AS days_ago
+            FROM opinions o
+            JOIN analysis a ON a.opinion_id = o.id
+            WHERE a.is_interesting = 1
+            GROUP BY o.court
+        """)
+        rows = cursor.fetchall()
+        conn.close()
+        stale = []
+        for court, last, days in rows:
+            if days is None:
+                continue
+            days_int = int(days)
+            if days_int > threshold_days:
+                stale.append({"court": court, "last_interesting": last, "days_ago": days_int})
+        return stale
+
+    def run_triage_audit(self, sample_size=10):
+        """Sample N recent Haiku-ROUTINE analyses, re-run each through the full
+        analysis pass (Opus via the main prompt), and report the disagreement
+        rate. A disagreement is when Opus identifies any interesting issue on
+        a case Haiku classified ROUTINE — i.e., a false negative.
+        """
+        conn = sqlite3.connect(self.db_path)
+        cursor = conn.cursor()
+        cursor.execute("""
+            SELECT a.id, a.case_number, a.analysis_text, o.file_path, o.court
+            FROM analysis a
+            JOIN opinions o ON a.opinion_id = o.id
+            WHERE a.analysis_text LIKE '%Haiku classified as ROUTINE%'
+            ORDER BY a.analysis_timestamp DESC
+            LIMIT ?
+        """, (sample_size,))
+        samples = cursor.fetchall()
+        conn.close()
+
+        if not samples:
+            print("No Haiku-ROUTINE analyses on record yet.")
+            return
+
+        print(f"Auditing {len(samples)} Haiku-ROUTINE analyses against the full prompt...\n")
+        disagreements = []
+        errors = 0
+        for aid, case_num, haiku_text, file_path, court in samples:
+            if not file_path or not os.path.exists(file_path):
+                errors += 1
+                print(f"  [SKIP] {case_num}: PDF missing ({file_path})")
+                continue
+            text = self.extract_text_from_pdf(file_path)
+            if not text:
+                errors += 1
+                print(f"  [SKIP] {case_num}: PDF extraction failed")
+                continue
+            full_prompt = f"{self.analysis_prompt}\n\n--- OPINION TEXT ---\n{text}"
+            try:
+                opus_text = call_claude_with_retry(
+                    prompt=full_prompt,
+                    timeout=300,
+                    max_retries=2,
+                    base_delay=5,
+                )
+            except Exception as exc:
+                errors += 1
+                print(f"  [ERROR] {case_num}: {exc}")
+                continue
+            opus_found_interesting = bool(opus_text) and not opus_text.strip().upper().startswith(
+                "TERSE REPORT: NO INTERESTING"
+            )
+            verdict = "DISAGREE" if opus_found_interesting else "AGREE"
+            if opus_found_interesting:
+                disagreements.append((case_num, court, opus_text))
+            print(f"  [{verdict}] {case_num} ({court})")
+
+        evaluated = len(samples) - errors
+        rate = (len(disagreements) / evaluated * 100.0) if evaluated else 0.0
+        print(f"\nSampled: {len(samples)}  Evaluated: {evaluated}  "
+              f"Disagreements: {len(disagreements)}  Rate: {rate:.1f}%")
+        if rate > 5.0:
+            print("WARNING: triage disagreement rate >5%. Consider loosening the Haiku prompt.")
+        if disagreements:
+            print("\nCases where Opus identified issues Haiku missed:")
+            for case_num, court, text in disagreements:
+                first_line = text.strip().splitlines()[0] if text else ""
+                print(f"  - {case_num} ({court}): {first_line[:120]}")
+
     def run_daily_automation(self, resume_run_id=None):
         """Run complete daily automation with resumption support"""
         target_date = self.get_current_business_day()
@@ -2289,12 +2599,18 @@ To unsubscribe, reply with 'unsubscribe' in the subject or body.
             # run.
             logger.info("Step 3: Generating report...")
             self.update_run_state(run_id, status='reporting')
-            report_path = self.generate_daily_report(target_date)
+            report_generation_error = None
+            report_path = None
             report_date_label = date_str
             report_date_range = None
+            try:
+                report_path = self.generate_daily_report(target_date)
+            except Exception as exc:
+                report_generation_error = exc
+                logger.error(f"generate_daily_report raised: {exc}")
 
-            if not report_path:
-                # Check for unreported interesting cases on other dates
+            if not report_path and report_generation_error is None:
+                # No interesting cases for today — widen the window.
                 last_completed = self._get_last_completed_date()
                 if last_completed:
                     range_start = (datetime.strptime(last_completed, '%Y-%m-%d').date()
@@ -2306,15 +2622,27 @@ To unsubscribe, reply with 'unsubscribe' in the subject or body.
                     logger.info(f"No interesting cases for {date_str}; "
                                 f"trying range {range_start} to {range_end}")
                     report_date_range = (range_start, range_end)
-                    report_path = self.generate_analysis_report(
-                        date_range=report_date_range)
+                    try:
+                        report_path = self.generate_analysis_report(
+                            date_range=report_date_range)
+                    except Exception as exc:
+                        report_generation_error = exc
+                        logger.error(f"generate_analysis_report raised: {exc}")
                     report_date_label = f"{range_start} to {range_end}"
 
-            if not report_path:
+            if not report_path and report_generation_error is None:
+                # Genuine no-cases state — nothing to send.
                 self.update_run_state(run_id, status='no_cases',
                                     error_message="No cases found for report")
                 logger.warning("No report generated (no cases found)")
                 return False
+
+            if report_generation_error is not None:
+                # PDF generation crashed but analyses succeeded — send email
+                # without the PDF attachment so the results still reach subscribers.
+                logger.warning("PDF generation failed; sending attachment-less email")
+                self.update_run_state(run_id, status='reporting',
+                                    error_message=f"PDF failed: {report_generation_error}")
 
             # Step 4: Check subscription emails
             logger.info("Step 4: Checking subscription emails...")
@@ -2750,28 +3078,31 @@ To unsubscribe, reply with 'unsubscribe' in the subject or body.
                 mail.select('INBOX')
                 logger.info("Fallback to main INBOX folder for subscription emails")
             
-            # Get last check time and search for emails since then
-            last_check = self.get_last_subscription_check()
-            current_time = datetime.now()
-            
-            # Format the date for IMAP search (DD-Mon-YYYY format)
-            since_date = last_check.strftime('%d-%b-%Y')
-            
-            # Search for emails since last check
-            status, message_ids = mail.search(None, f'SINCE {since_date}')
-            
+            # UID-based incremental search: idempotent, not spoofable via Date header.
+            mailbox_key = 'subscription'
+            last_uid = self._get_last_imap_uid(mailbox_key)
+            search_criteria = f'{last_uid + 1}:*' if last_uid else 'ALL'
+            status, message_ids = mail.uid('search', None, search_criteria)
+
             if status != 'OK':
-                logger.error("Failed to search for emails")
+                logger.error("Failed to search for emails by UID")
                 return False
-            
+
             message_ids = message_ids[0].split()
-            logger.info(f"Found {len(message_ids)} emails since last check ({last_check.strftime('%Y-%m-%d %H:%M:%S')})")
+            # UID SEARCH 'N:*' returns the last message even when there are none newer.
+            if last_uid:
+                message_ids = [mid for mid in message_ids if int(mid) > last_uid]
+            logger.info(f"Found {len(message_ids)} new emails since UID {last_uid}")
+            max_uid_seen = last_uid
             processed_count = 0
             
             for msg_id in message_ids:
                 try:
-                    # Fetch email
-                    status, msg_data = mail.fetch(msg_id, '(RFC822)')
+                    uid_int = int(msg_id)
+                    if uid_int > max_uid_seen:
+                        max_uid_seen = uid_int
+                    # Fetch email by UID
+                    status, msg_data = mail.uid('fetch', msg_id, '(RFC822)')
                     if status != 'OK':
                         continue
                     
@@ -2832,7 +3163,9 @@ To unsubscribe, reply with 'unsubscribe' in the subject or body.
             mail.logout()
             
             # Save the current time as the last check time
-            self.save_last_subscription_check(current_time)
+            if max_uid_seen > last_uid:
+                self._set_last_imap_uid(mailbox_key, max_uid_seen)
+            self.save_last_subscription_check(datetime.now())
             
             if processed_count > 0:
                 logger.info(f"Processed {processed_count} subscription requests")
@@ -3036,6 +3369,19 @@ def main():
                 print("✅ Subscription check completed")
             else:
                 print("❌ Subscription check failed")
+        elif command == "triage-audit":
+            n = int(sys.argv[2]) if len(sys.argv) > 2 else 10
+            bot.run_triage_audit(sample_size=n)
+        elif command == "court-staleness":
+            threshold = int(sys.argv[2]) if len(sys.argv) > 2 else 21
+            stale = bot.check_court_staleness(threshold_days=threshold)
+            if not stale:
+                print(f"All courts current (threshold: {threshold} days).")
+            else:
+                print(f"Stale courts (no interesting issues in >{threshold} days):")
+                for entry in stale:
+                    print(f"  {entry['court']}: last {entry['last_interesting']} "
+                          f"({entry['days_ago']} days ago)")
         elif command == "test-email":
             # Send test email to specified recipient
             if len(sys.argv) > 2:
@@ -3063,6 +3409,8 @@ def main():
             print("  members      - Show subscription members and recipients")
             print("  check-subscriptions - Manually check for subscription emails")
             print("  test-email <email> - Send test email to specified recipient")
+            print("  triage-audit [N]   - Re-run Opus on N recent Haiku-ROUTINE cases; report disagreement rate")
+            print("  court-staleness [days] - List courts with no interesting issue in the last N days (default 21)")
             print("  backfill-urls - Update existing records with direct PDF URLs")
             print("  analyze-dir <path> - Analyze all PDFs in specific directory")
             print("")
