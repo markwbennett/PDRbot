@@ -135,3 +135,9 @@ opinions/
 
 # Vagrant
 .vagrant/
+
+
+# Backup files from tooling
+*.bak
+.env.*
+
