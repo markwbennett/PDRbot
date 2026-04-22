@@ -2266,7 +2266,7 @@ To unsubscribe, reply with 'unsubscribe' in the subject or body.
         if interesting_count > 0:
             headlines = []
             for r in results[:3]:
-                text = r[5] if len(r) > 5 else ""
+                text = r[3] if len(r) > 3 else ""
                 extracted = self.extract_headlines_from_analysis(text) or []
                 if extracted:
                     headlines.append(extracted[0])
