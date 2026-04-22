@@ -607,25 +607,38 @@ class PDRBot:
                 has_interesting_issues = False
                 issue_count = 0
             else:
-                # Count issues - handle multiple format variations
-                issue_patterns = [
-                    r'▪\s*Issue Description:',
-                    r'\*\*Issue Description:\*\*',
-                    r'\*\*Issue \d+:',
-                    r'Issue \d+:',
-                    r'▪\s*Headline:',
-                    r'\*\*Headline:\*\*',
-                ]
-                issue_count = 0
-                for pattern in issue_patterns:
-                    count = len(re.findall(pattern, cleaned_text))
-                    issue_count = max(issue_count, count)
+                # Prefer the structured-JSON envelope emitted by the current
+                # triage-plus-full-analysis pipeline. If the analysis is not
+                # JSON, fall back to the legacy "no interesting issues" phrase
+                # check and markdown issue markers.
+                parsed_issues = None
+                try:
+                    parsed = json.loads(cleaned_text)
+                    if isinstance(parsed, dict) and isinstance(parsed.get('issues'), list):
+                        parsed_issues = parsed['issues']
+                except (json.JSONDecodeError, ValueError):
+                    pass
 
-                # Interesting = has structured issues AND doesn't say "no interesting issues"
-                has_interesting_issues = (
-                    issue_count > 0
-                    and "no interesting issues" not in cleaned_text.lower()
-                )
+                if parsed_issues is not None:
+                    issue_count = len(parsed_issues)
+                    has_interesting_issues = issue_count > 0
+                elif "no interesting issues" in cleaned_text.lower():
+                    has_interesting_issues = False
+                    issue_count = 0
+                else:
+                    issue_patterns = [
+                        r'▪\s*Issue Description:',
+                        r'\*\*Issue Description:\*\*',
+                        r'\*\*Issue \d+:',
+                        r'Issue \d+:',
+                        r'▪\s*Headline:',
+                        r'\*\*Headline:\*\*',
+                    ]
+                    issue_count = 0
+                    for pattern in issue_patterns:
+                        count = len(re.findall(pattern, cleaned_text))
+                        issue_count = max(issue_count, count)
+                    has_interesting_issues = issue_count > 0
 
             # Extract PDR score
             pdr_score = self.extract_pdr_score(cleaned_text)
