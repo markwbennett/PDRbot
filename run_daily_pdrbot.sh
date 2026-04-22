@@ -19,17 +19,24 @@ if [ -f ".env" ]; then
 fi
 
 # Export Doppler-managed credentials for this run.
+# Doppler's --format env emits KEY="value" lines; sourcing them through
+# bash (with set -a) correctly strips the quotes, which `export "$line"`
+# does not.
 if command -v doppler >/dev/null 2>&1; then
     DOPPLER_ENV="$(doppler secrets download --project shell-secrets --config dev --no-file --format env 2>/dev/null)"
     if [ -n "$DOPPLER_ENV" ]; then
-        while IFS= read -r line; do
-            [ -z "$line" ] && continue
-            export "$line"
-        done <<< "$DOPPLER_ENV"
+        set -a
+        source <(printf '%s\n' "$DOPPLER_ENV")
+        set +a
     else
         echo "WARNING: doppler secrets load returned empty; .env values only"
     fi
 fi
+
+# The claude CLI reads these env vars in preference to ~/.claude/.credentials.json.
+# The OAuth token file is refreshed by the keep-alive cron and is the authoritative
+# source on this host; unset any Doppler-stored overrides so the CLI uses it.
+unset CLAUDE_CODE_OAUTH_TOKEN ANTHROPIC_API_KEY CLAUDE_API_KEY
 
 # Log file for cron job output
 LOG_FILE="data/pdrbot_cron.log"
