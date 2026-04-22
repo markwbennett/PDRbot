@@ -2093,7 +2093,7 @@ class PDRBot:
             for result in results:
                 case_number = result[0]
                 court = result[1]
-                analysis_text = render_analysis_prose(result[3])
+                analysis_text = result[3]
                 issue_count = result[5]
                 pdf_url = result[9]
                 pdr_score = result[11] if len(result) > 11 else None
@@ -2187,7 +2187,7 @@ class PDRBot:
             for result in results:
                 case_number = result[0]
                 court = result[1]
-                analysis_text = render_analysis_prose(result[3])
+                analysis_text = result[3]
                 issue_count = result[5]
                 pdr_score = result[11] if len(result) > 11 else None
 
