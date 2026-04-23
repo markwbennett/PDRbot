@@ -129,6 +129,7 @@ dmypy.json
 *.swo
 
 # Data directory (symlink)
+data
 data/
 
 opinions/

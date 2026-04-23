@@ -40,7 +40,7 @@ from reportlab.lib import colors
 from reportlab.lib.enums import TA_LEFT, TA_CENTER, TA_JUSTIFY
 
 # Add mwb_common to path
-sys.path.insert(0, '/home/mb/github/mwb_common')
+sys.path.insert(0, os.path.expanduser('~/github/mwb_common'))
 from mwb_claude import call_claude_with_retry, get_current_model
 
 # Set up logging

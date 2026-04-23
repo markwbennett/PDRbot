@@ -178,5 +178,17 @@ Time: $(date '+%Y-%m-%d %H:%M:%S')
 Host: $(hostname)"
 fi
 
+# Run Anders Project audit on today's opinions.
+# Non-fatal -- failure here does not affect pdrbot exit code.
+log_message "Running Anders Project audit..."
+if ./.venv/bin/python andersproject.py 2>&1 | tee -a "$LOG_FILE"; then
+    log_message "Anders Project audit completed"
+else
+    log_message "WARNING: Anders Project audit failed (exit $?)"
+    send_failure_alert \
+        "AndersProject: audit failed" \
+        "andersproject.py exited non-zero after pdrbot run. Check: $(hostname):$(readlink -f \"$LOG_FILE\") Time: $(date '+%Y-%m-%d %H:%M:%S')"
+fi
+
 log_message "PDRBot daily automation finished"
 exit $EXIT_CODE
