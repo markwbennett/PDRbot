@@ -190,5 +190,16 @@ else
         "andersproject.py exited non-zero after pdrbot run. Check: $(hostname):$(readlink -f \"$LOG_FILE\") Time: $(date '+%Y-%m-%d %H:%M:%S')"
 fi
 
+log_message "Running tx-criminal-oralarg-calendar build..."
+if /home/ubuntu/github/tx-criminal-oralarg-calendar/run.sh 2>&1 | tee -a "$LOG_FILE"; then
+    log_message "Calendar build completed"
+else
+    RC=$?
+    log_message "WARNING: Calendar build failed (exit $RC)"
+    send_failure_alert \
+        "tx-criminal-oralarg-calendar: build failed" \
+        "Calendar build exited $RC. See $(hostname):$(readlink -f \"$LOG_FILE\") Time: $(date '+%Y-%m-%d %H:%M:%S')"
+fi
+
 log_message "PDRBot daily automation finished"
 exit $EXIT_CODE
