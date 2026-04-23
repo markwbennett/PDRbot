@@ -2644,11 +2644,13 @@ To unsubscribe, reply with 'unsubscribe' in the subject or body.
                     report_date_label = f"{range_start} to {range_end}"
 
             if not report_path and report_generation_error is None:
-                # Genuine no-cases state — nothing to send.
-                self.update_run_state(run_id, status='no_cases',
-                                    error_message="No cases found for report")
-                logger.warning("No report generated (no cases found)")
-                return False
+                # Genuine no-cases state — nothing interesting to report.
+                # This is not a failure: the automation ran cleanly, there
+                # was just nothing worth emailing. Return True so the wrapper
+                # script does not send a spurious failure alert.
+                self.update_run_state(run_id, status='no_cases')
+                logger.info("No report generated (no interesting cases found)")
+                return True
 
             if report_generation_error is not None:
                 # PDF generation crashed but analyses succeeded — send email
