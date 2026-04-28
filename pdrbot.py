@@ -461,27 +461,53 @@ class PDRBot:
         """Fast Haiku pass. Returns first line of the response, or None on
         failure (caller falls through to full Opus pass)."""
         triage_prompt = (
-            "You are a triage assistant for a Texas criminal-defense appellate "
-            "practice. You are deciding whether an opinion deserves a full "
-            "analysis pass.\n\n"
+            "You are the first pass of a two-stage triage for a Texas "
+            "criminal-defense appellate practice. Cases you mark INTERESTING "
+            "go to a more capable model (Opus) for full analysis; cases you "
+            "mark ROUTINE are not analyzed further. Your only job is to "
+            "filter out truly cookie-cutter dispositions — the deeper model "
+            "is the authoritative judge of what is PDR-worthy.\n\n"
             "Reply with exactly one line.\n\n"
-            "Write 'INTERESTING: <one-sentence reason>' if the opinion contains "
-            "any of:\n"
-            "- a novel or unsettled legal question\n"
-            "- a split among Texas courts (acknowledged or emerging)\n"
-            "- a constitutional question that is not clearly resolved\n"
-            "- reliance on pre-2000 Court of Criminal Appeals authority for a "
-            "contested point\n"
-            "- a demonstrable logical flaw in the court's reasoning that "
-            "affected the outcome\n\n"
-            "Write 'ROUTINE: <one-sentence reason>' if the opinion is a "
-            "fact-bound application of settled law with none of those "
-            "features.\n\n"
-            "Err on the side of INTERESTING when in doubt. A false ROUTINE "
-            "loses a PDR-worthy case; a false INTERESTING just costs one more "
-            "analysis call.\n\n"
-            "Your entire reply must be a single line starting with "
-            "'INTERESTING:' or 'ROUTINE:'."
+            "Default to INTERESTING. Mark ROUTINE only when the opinion is "
+            "truly cookie-cutter — a boilerplate disposition that could have "
+            "been written from a template, with no contested legal question, "
+            "no debatable application of law to fact, no concurrence or "
+            "dissent, and no discussion beyond reciting settled doctrine and "
+            "applying it to overwhelming or uncontested facts.\n\n"
+            "Cookie-cutter patterns (non-exhaustive):\n"
+            "- Anders affirmance with no arguable grounds and no "
+            "fine/cost/restitution issue\n"
+            "- Jurisdictional dismissal for untimely notice of appeal, no "
+            "tolling argument\n"
+            "- Habeas dismissed for failure to comply with statutory "
+            "prerequisites, no merits discussion\n"
+            "- Mandamus denied solely on want of presentment or want of "
+            "clear right, no contested record\n"
+            "- Frivolous-appeal dismissal with no preserved issues briefed\n"
+            "- Plea-bargain waiver dismissal under Rule 25.2(a)(2) with no "
+            "certification dispute\n\n"
+            "Anything else is INTERESTING — including any concurrence or "
+            "dissent, any sufficiency or burden-of-proof challenge against "
+            "non-overwhelming facts, any case where the court engages with a "
+            "doctrinal question even briefly, any case where the court "
+            "relies on cited authority to defeat a non-frivolous argument, "
+            "and any case decided on a close or contested record.\n\n"
+            "Always escalate when you see explicit textual signals like:\n"
+            "- the opinion itself flags an unresolved or unsettled question "
+            "('has not determined,' 'has not addressed,' 'we have not "
+            "found,' 'no controlling authority,' 'unsettled,' 'open "
+            "question,' or a Pattern Jury Charges committee note flagging "
+            "a gap)\n"
+            "- the court relies on pre-2000 Court of Criminal Appeals "
+            "authority for a contested point\n"
+            "- the court acknowledges or describes a split among Texas "
+            "courts of appeals (even where it picks a side)\n"
+            "- a concurrence or dissent rejects the majority's framework\n\n"
+            "A false ROUTINE loses a PDR-worthy case; a false INTERESTING "
+            "costs only one extra Opus call. When in doubt, escalate.\n\n"
+            "Your entire reply must be a single line, exactly one of:\n"
+            "- 'INTERESTING.'  (no justification — Opus will analyze)\n"
+            "- 'ROUTINE: <one-sentence reason>'"
         )
         try:
             result = call_claude_with_retry(
@@ -2586,8 +2612,11 @@ To unsubscribe, reply with 'unsubscribe' in the subject or body.
             self.resume_daily_scrape(run_id, target_date)
             
             # Step 2: Run analysis
+            # Use the date-agnostic queue: rolled-over opinions from prior
+            # business days share today's run, so a date-filtered count
+            # would skip them whenever today's courts have not yet posted.
             if self.analysis_enabled:
-                unanalyzed_count = len(self.get_unanalyzed_opinions_for_date(date_str))
+                unanalyzed_count = len(self.get_unanalyzed_opinions())
                 if unanalyzed_count > 0:
                     logger.info(f"Step 2: Running analysis on {unanalyzed_count} cases...")
                     self.update_run_state(run_id, status='analyzing')
@@ -2817,7 +2846,7 @@ To unsubscribe, reply with 'unsubscribe' in the subject or body.
                 self.resume_daily_scrape(run_id, target_date)
             
             # Check if analysis is needed
-            unanalyzed_count = len(self.get_unanalyzed_opinions_for_date(target_date_str))
+            unanalyzed_count = len(self.get_unanalyzed_opinions())
             if unanalyzed_count > 0 and self.analysis_enabled:
                 logger.info(f"Resuming analysis phase... {unanalyzed_count} cases to analyze")
                 self.update_run_state(run_id, status='analyzing')
