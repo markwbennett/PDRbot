@@ -8,8 +8,11 @@ an Anders/Gainous brief in a trial (non-plea) case, and checks whether:
      describes the evidence supporting each element.
   2. If not, whether the Anders brief itself did so.
 
-Cases where neither the opinion nor the brief satisfied that standard
-are emailed to mb@ivi3.com from andersproject@iacls.org.
+A daily heartbeat email is sent to mb@ivi3.com from andersproject@iacls.org
+summarizing the day's Anders findings: total opinions, Anders count, plea vs.
+trial split, and for trial cases whether the elements-and-evidence requirement
+was met by the opinion, by the brief, or neither. Deficient cases (and their
+brief PDFs as attachments) are included in the same email.
 
 Usage:
     python andersproject.py              # analyze yesterday's opinions
@@ -386,7 +389,81 @@ def process_opinion(conn: sqlite3.Connection, row: tuple, reanalyze: bool = Fals
 
 # ── Email report ──────────────────────────────────────────────────────────────
 
-def _html_report(items: list[dict], target_date: str) -> str:
+def build_summary(conn: sqlite3.Connection, target_date: str) -> dict:
+    """Compile the daily Anders summary used by the heartbeat email."""
+    total = conn.execute(
+        'SELECT COUNT(*) FROM opinions WHERE opinion_date=?',
+        (target_date,),
+    ).fetchone()[0]
+
+    rows = conn.execute(
+        '''SELECT aa.case_number, aa.court, aa.is_trial,
+                  aa.opinion_lists_elements, aa.brief_lists_elements,
+                  aa.brief_url, aa.offense_name, o.case_url
+             FROM anders_analyses aa
+             LEFT JOIN opinions o ON o.id = aa.opinion_id
+            WHERE aa.opinion_date=? AND aa.is_anders=1
+            ORDER BY aa.case_number''',
+        (target_date,),
+    ).fetchall()
+
+    cols = ('case_number', 'court', 'is_trial', 'opinion_lists',
+            'brief_lists', 'brief_url', 'offense', 'case_url')
+    anders = [dict(zip(cols, r)) for r in rows]
+
+    plea = [a for a in anders if a['is_trial'] == 0]
+    trial = [a for a in anders if a['is_trial'] == 1]
+    unknown = [a for a in anders if a['is_trial'] not in (0, 1)]
+
+    opinion_covers = [a for a in trial if a['opinion_lists'] == 1]
+    brief_covers = [a for a in trial if a['opinion_lists'] == 0
+                    and a['brief_lists'] == 1]
+    deficient = [a for a in trial if a['opinion_lists'] == 0
+                 and a['brief_lists'] == 0]
+    brief_unavailable = [a for a in trial if a['opinion_lists'] == 0
+                         and a['brief_lists'] is None]
+
+    return {
+        'total_opinions': total,
+        'anders_count': len(anders),
+        'plea_count': len(plea),
+        'trial_count': len(trial),
+        'unknown_count': len(unknown),
+        'opinion_covers': opinion_covers,
+        'brief_covers': brief_covers,
+        'deficient': deficient,
+        'brief_unavailable': brief_unavailable,
+    }
+
+
+def _subject(summary: dict, target_date: str) -> str:
+    flagged = len(summary['deficient']) + len(summary['brief_unavailable'])
+    if flagged:
+        return (f'Anders Project — DEFICIENT: {flagged} case(s) — '
+                f'{target_date}')
+    if summary['anders_count'] == 0:
+        return f'Anders Project — {target_date} — no Anders opinions'
+    if summary['trial_count'] == 0:
+        return (f'Anders Project — {target_date} — '
+                f'{summary["anders_count"]} Anders (all plea/revocation)')
+    if summary['brief_covers']:
+        return (f'Anders Project — {target_date} — '
+                f'{summary["trial_count"]} trial Anders, '
+                f'{len(summary["brief_covers"])} covered by brief only')
+    return (f'Anders Project — {target_date} — '
+            f'{summary["trial_count"]} trial Anders, opinions list elements')
+
+
+def _bullet_list_text(cases: list[dict]) -> list[str]:
+    out = []
+    for a in cases:
+        offense = a.get('offense') or '—'
+        out.append(f'      • {a["case_number"]} ({a["court"]}) — {offense}')
+    return out
+
+
+def _html_report(items: list[dict], target_date: str,
+                 summary: dict | None = None) -> str:
     rows = ''
     for it in items:
         case_link = (f'<a href="{it["case_url"]}">{it["case_number"]}</a>'
@@ -402,15 +479,10 @@ def _html_report(items: list[dict], target_date: str) -> str:
           <td>{brief_link}</td>
         </tr>"""
 
-    return f"""<!DOCTYPE html><html><head><style>
-body{{font-family:sans-serif;font-size:14px}}
-table{{border-collapse:collapse;width:100%}}
-th,td{{border:1px solid #ccc;padding:6px 10px;text-align:left}}
-th{{background:#f0f0f0}}
-.banner{{background:#fff3cd;border:1px solid #ffc107;padding:10px;
-         margin-bottom:16px;border-radius:4px}}
-</style></head><body>
-<h2>Anders Brief Deficiency Report — {target_date}</h2>
+    deficiency_section = ''
+    if items:
+        deficiency_section = f"""
+<h3>Deficient cases</h3>
 <div class="banner"><strong>{len(items)} case(s)</strong> where appointed counsel
 filed an Anders brief in a trial case but neither the COA opinion nor the brief
 identified the elements of the charged offense and described supporting evidence.
@@ -421,40 +493,141 @@ identified the elements of the charged offense and described supporting evidence
 </tr></thead>
 <tbody>{rows}</tbody>
 </table>
+"""
+
+    heartbeat_section = ''
+    if summary is not None:
+        def _li(cases):
+            if not cases:
+                return ''
+            lis = ''.join(
+                f'<li>{a["case_number"]} ({a["court"]}) — '
+                f'{a.get("offense") or "—"}</li>'
+                for a in cases
+            )
+            return f'<ul>{lis}</ul>'
+
+        s = summary
+        trial_block = ''
+        if s['trial_count']:
+            parts = [f'<li>Trial: {s["trial_count"]}']
+            if s['opinion_covers']:
+                parts.append(
+                    f'<div>Opinion lists elements: '
+                    f'{len(s["opinion_covers"])}{_li(s["opinion_covers"])}</div>'
+                )
+            if s['brief_covers']:
+                parts.append(
+                    f'<div>Opinion does not, but brief does: '
+                    f'{len(s["brief_covers"])}{_li(s["brief_covers"])}</div>'
+                )
+            if s['deficient']:
+                parts.append(
+                    f'<div><strong>Neither (DEFICIENT):</strong> '
+                    f'{len(s["deficient"])}{_li(s["deficient"])}</div>'
+                )
+            if s['brief_unavailable']:
+                parts.append(
+                    f'<div>Brief unavailable: '
+                    f'{len(s["brief_unavailable"])}'
+                    f'{_li(s["brief_unavailable"])}</div>'
+                )
+            parts.append('</li>')
+            trial_block = ''.join(parts)
+        else:
+            trial_block = '<li>Trial: 0</li>'
+
+        heartbeat_section = f"""
+<h3>Daily heartbeat</h3>
+<ul>
+  <li>Opinions analyzed: {s['total_opinions']}</li>
+  <li>Anders briefs identified: {s['anders_count']}</li>
+  <li>Plea/revocation (criteria N/A): {s['plea_count']}</li>
+  {trial_block}
+</ul>
+"""
+
+    return f"""<!DOCTYPE html><html><head><style>
+body{{font-family:sans-serif;font-size:14px}}
+table{{border-collapse:collapse;width:100%}}
+th,td{{border:1px solid #ccc;padding:6px 10px;text-align:left}}
+th{{background:#f0f0f0}}
+.banner{{background:#fff3cd;border:1px solid #ffc107;padding:10px;
+         margin-bottom:16px;border-radius:4px}}
+ul{{margin:4px 0}}
+</style></head><body>
+<h2>Anders Project — {target_date}</h2>
+{heartbeat_section}
+{deficiency_section}
 <p style="color:#666;font-size:12px">Generated by andersproject · {date.today().isoformat()}</p>
 </body></html>"""
 
 
-def _text_report(items: list[dict], target_date: str) -> str:
-    lines = [
-        f'Anders Brief Deficiency Report — {target_date}',
-        f'{len(items)} case(s)',
-        '',
-    ]
-    for it in items:
+def _text_report(items: list[dict], target_date: str,
+                 summary: dict | None = None) -> str:
+    lines = [f'Anders Project — daily summary for {target_date}', '']
+
+    if summary is not None:
+        s = summary
         lines += [
-            f"Case:    {it['case_number']}",
-            f"Court:   {it.get('court','')}",
-            f"Offense: {it.get('offense_name') or '—'}",
-            f"Issue:   {it.get('failure_reason','')}",
+            f'Opinions analyzed: {s["total_opinions"]}',
+            f'Anders briefs identified: {s["anders_count"]}',
+            f'  Plea/revocation (criteria N/A): {s["plea_count"]}',
         ]
-        if it.get('case_url'):
-            lines.append(f"COA:     {it['case_url']}")
-        if it.get('brief_url'):
-            lines.append(f"Brief:   {it['brief_url']}")
+        lines.append(f'  Trial: {s["trial_count"]}')
+        if s['opinion_covers']:
+            lines.append(f'    Opinion lists elements: {len(s["opinion_covers"])}')
+            lines += _bullet_list_text(s['opinion_covers'])
+        if s['brief_covers']:
+            lines.append(
+                f'    Opinion does not, but brief does: '
+                f'{len(s["brief_covers"])}'
+            )
+            lines += _bullet_list_text(s['brief_covers'])
+        if s['deficient']:
+            lines.append(f'    NEITHER (deficient): {len(s["deficient"])}')
+            lines += _bullet_list_text(s['deficient'])
+        if s['brief_unavailable']:
+            lines.append(
+                f'    Brief unavailable: {len(s["brief_unavailable"])}'
+            )
+            lines += _bullet_list_text(s['brief_unavailable'])
+        if s['unknown_count']:
+            lines.append(f'  is_trial unknown: {s["unknown_count"]}')
         lines.append('')
+
+    if items:
+        lines.append('---')
+        lines.append(f'Deficient case details — {len(items)} case(s)')
+        lines.append('')
+        for it in items:
+            lines += [
+                f"Case:    {it['case_number']}",
+                f"Court:   {it.get('court','')}",
+                f"Offense: {it.get('offense_name') or '—'}",
+                f"Issue:   {it.get('failure_reason','')}",
+            ]
+            if it.get('case_url'):
+                lines.append(f"COA:     {it['case_url']}")
+            if it.get('brief_url'):
+                lines.append(f"Brief:   {it['brief_url']}")
+            lines.append('')
     return '\n'.join(lines)
 
 
 def send_report(items: list[dict], target_date: str,
-                attachments: list[Path], dry_run: bool = False) -> None:
+                attachments: list[Path], dry_run: bool = False,
+                summary: dict | None = None) -> None:
     smtp_host = os.environ.get('EMAIL_SMTP_HOST', 'smtp.gmail.com')
     smtp_port = int(os.environ.get('EMAIL_SMTP_PORT', '587'))
     smtp_user = os.environ.get('EMAIL_AUTH_USER', os.environ.get('EMAIL_FROM', ''))
     smtp_pass = os.environ.get('EMAIL_PASSWORD', '')
 
-    subject = (f'Anders Brief Deficiency Report — {len(items)} case(s)'
-               f' — {target_date}')
+    if summary is not None:
+        subject = _subject(summary, target_date)
+    else:
+        subject = (f'Anders Brief Deficiency Report — {len(items)} case(s)'
+                   f' — {target_date}')
 
     msg = MIMEMultipart('mixed')
     msg['From'] = FROM_ADDR
@@ -462,8 +635,8 @@ def send_report(items: list[dict], target_date: str,
     msg['Subject'] = subject
 
     alt = MIMEMultipart('alternative')
-    alt.attach(MIMEText(_text_report(items, target_date), 'plain'))
-    alt.attach(MIMEText(_html_report(items, target_date), 'html'))
+    alt.attach(MIMEText(_text_report(items, target_date, summary), 'plain'))
+    alt.attach(MIMEText(_html_report(items, target_date, summary), 'html'))
     msg.attach(alt)
 
     for p in attachments:
@@ -480,7 +653,7 @@ def send_report(items: list[dict], target_date: str,
         print(f'Subj: {subject}')
         print(f'Attachments: {[p.name for p in attachments if p.exists()]}')
         print()
-        print(_text_report(items, target_date))
+        print(_text_report(items, target_date, summary))
         return
 
     try:
@@ -547,7 +720,18 @@ def main() -> None:
                 LOG.error('Error processing %s: %s', row[1], e)
             time.sleep(0.5)
 
-    # Collect unsent report items
+    # Build the daily heartbeat summary
+    summary = build_summary(conn, target_date)
+    LOG.info(
+        'Heartbeat: %d opinions, %d Anders (%d plea, %d trial); '
+        'opinion-covers=%d, brief-covers=%d, deficient=%d, brief-unavail=%d',
+        summary['total_opinions'], summary['anders_count'],
+        summary['plea_count'], summary['trial_count'],
+        len(summary['opinion_covers']), len(summary['brief_covers']),
+        len(summary['deficient']), len(summary['brief_unavailable']),
+    )
+
+    # Collect unsent report items (deficient cases)
     items_rows = conn.execute(
         '''SELECT case_number, court, opinion_date, case_url,
                   brief_url, offense_name, failure_reason
@@ -560,14 +744,10 @@ def main() -> None:
             'brief_url', 'offense_name', 'failure_reason']
     items = [dict(zip(cols, r)) for r in items_rows]
 
-    if not items:
-        LOG.info('No deficient Anders cases to report for %s.', target_date)
-        conn.close()
-        return
+    if items:
+        LOG.info('%d deficient item(s) to report', len(items))
 
-    LOG.info('%d item(s) to report', len(items))
-
-    # Collect brief PDFs for attachment
+    # Collect brief PDFs for attachment (deficient cases only)
     attachments: list[Path] = []
     for it in items:
         row = conn.execute(
@@ -582,9 +762,10 @@ def main() -> None:
             if p.exists():
                 attachments.append(p)
 
-    send_report(items, target_date, attachments, dry_run=args.dry_run)
+    send_report(items, target_date, attachments,
+                dry_run=args.dry_run, summary=summary)
 
-    if not args.dry_run:
+    if items and not args.dry_run:
         conn.execute(
             "UPDATE anders_report_items SET emailed_at=datetime('now','localtime') "
             "WHERE emailed_at IS NULL"
