@@ -76,13 +76,8 @@ Definitions:
   brief (sometimes called an Anders/Gainous brief) representing there are no
   non-frivolous appellate issues.
 - "is_trial": true if the underlying conviction followed a jury or bench trial;
-  false if it followed a guilty or no-contest plea; null ONLY if is_anders is
-  false. When is_anders is true, you must return true or false — never null.
-  If the opinion does not state the plea/trial disposition explicitly, infer
-  from context: sentences like "the jury convicted" or "following trial" mean
-  true; sentences like "appellant pleaded guilty" or "pursuant to a plea
-  agreement" mean false. If there is truly no information at all, default to
-  true (trial), which triggers the more protective review path.
+  false if it followed a guilty or no-contest plea; null if is_anders is false
+  or the opinion does not contain enough information to determine this.
 - "opinion_lists_elements": true if the opinion (a) names the specific statutory
   elements of the charged offense AND (b) describes the trial evidence that
   supports each element. false if it does not do both. null if is_anders is false
@@ -98,15 +93,19 @@ You are a Texas appellate practice expert reviewing an Anders brief.
 Answer ONLY with a JSON object — no other text.
 
 {
-  "brief_lists_elements": true/false,
+  "is_trial": true/false/null,
+  "brief_lists_elements": true/false/null,
   "notes": "one sentence"
 }
 
 Definitions:
+- "is_trial": true if the underlying conviction followed a jury or bench trial;
+  false if it followed a guilty or no-contest plea; null only if the brief
+  contains no information about the mode of conviction.
 - "brief_lists_elements": true if the brief (a) identifies the specific statutory
   elements of the charged offense AND (b) describes the trial evidence that
   supports each element in the sufficiency-of-evidence review. false if it does
-  not do both.
+  not do both. null if is_trial is false (plea cases are out of scope).
 
 BRIEF TEXT:
 """
@@ -321,8 +320,25 @@ def process_opinion(conn: sqlite3.Connection, row: tuple, reanalyze: bool = Fals
     brief_url = None
     brief_pdf_path = None
 
-    # If Anders + trial + opinion did NOT list elements, check the brief
-    if is_anders and is_trial and opinion_lists is False:
+    # If Anders and is_trial ambiguous from opinion, consult the brief
+    if is_anders and is_trial is None:
+        LOG.info('  is_trial ambiguous from opinion; fetching brief to resolve')
+        brief_url, brief_pdf = fetch_anders_brief(case_number, court)
+        if brief_pdf:
+            brief_pdf_path = str(brief_pdf)
+            br = analyze_brief(brief_pdf)
+            resolved = br.get('is_trial')
+            if resolved is not None:
+                is_trial = resolved
+                LOG.info('  is_trial resolved from brief: %s', is_trial)
+            brief_lists = br.get('brief_lists_elements')
+            LOG.info('  brief_lists_elements=%s', brief_lists)
+        else:
+            LOG.info('  Anders brief not found or not downloadable')
+        time.sleep(1.0)
+
+    # If Anders + trial + opinion did NOT list elements, check the brief (if not already fetched)
+    if is_anders and is_trial and opinion_lists is False and brief_url is None:
         LOG.info('  Fetching Anders brief from search.txcourts.gov...')
         brief_url, brief_pdf = fetch_anders_brief(case_number, court)
         if brief_pdf:
