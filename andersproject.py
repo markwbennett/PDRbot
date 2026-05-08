@@ -76,8 +76,13 @@ Definitions:
   brief (sometimes called an Anders/Gainous brief) representing there are no
   non-frivolous appellate issues.
 - "is_trial": true if the underlying conviction followed a jury or bench trial;
-  false if it followed a guilty or no-contest plea; null if is_anders is false
-  or cannot be determined.
+  false if it followed a guilty or no-contest plea; null ONLY if is_anders is
+  false. When is_anders is true, you must return true or false — never null.
+  If the opinion does not state the plea/trial disposition explicitly, infer
+  from context: sentences like "the jury convicted" or "following trial" mean
+  true; sentences like "appellant pleaded guilty" or "pursuant to a plea
+  agreement" mean false. If there is truly no information at all, default to
+  true (trial), which triggers the more protective review path.
 - "opinion_lists_elements": true if the opinion (a) names the specific statutory
   elements of the charged offense AND (b) describes the trial evidence that
   supports each element. false if it does not do both. null if is_anders is false
