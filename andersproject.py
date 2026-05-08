@@ -563,7 +563,7 @@ identified the elements of the charged offense and described supporting evidence
 <ul>
   <li>Opinions analyzed: {s['total_opinions']}</li>
   <li>Anders briefs identified: {s['anders_count']}</li>
-  <li>Plea/revocation (criteria N/A): {s['plea_count']}</li>
+  <li>Plea: {s['plea_count']}</li>
   {trial_block}
 </ul>
 """
@@ -593,7 +593,7 @@ def _text_report(items: list[dict], target_date: str,
         lines += [
             f'Opinions analyzed: {s["total_opinions"]}',
             f'Anders briefs identified: {s["anders_count"]}',
-            f'  Plea/revocation (criteria N/A): {s["plea_count"]}',
+            f'  Plea: {s["plea_count"]}',
         ]
         lines.append(f'  Trial: {s["trial_count"]}')
         if s['opinion_covers']:
