@@ -219,10 +219,16 @@ def fetch_anders_brief(case_number: str, court: str) -> tuple[str | None, Path |
     link_re = re.compile(r'\[(https?://[^\]]+)\]')
 
     for row in brief_grid.find_all('tr', class_=lambda c: c and ('rgRow' in c or 'rgAltRow' in c)):
-        row_text = row.get_text(' ', strip=True)
-        if not re.search(r'anders', row_text, re.IGNORECASE):
+        # Match the Event Type column exactly. Substring matching on the whole
+        # row picks up the State's "Brief Waiver-Anders Response" rows, which
+        # share the word "Anders" but link to a different PDF.
+        tds = row.find_all('td', recursive=False)
+        if len(tds) < 2:
             continue
-        # Found an Anders row — grab first PDF link
+        if tds[1].get_text(strip=True).lower() != 'anders brief filed':
+            continue
+        # Appellant's Anders brief row — first PDF link is the brief itself
+        # (the second link, when present, is the notice of filing).
         for a in row.find_all('a'):
             href = a.get('href', '')
             if not href.startswith('http'):
