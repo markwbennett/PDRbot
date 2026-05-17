@@ -71,7 +71,19 @@ ANALYSIS_JSON_SCHEMA = {
                     "discussion": {"type": "string", "description": "Quotes or specific references from the opinion showing novelty or controversy."},
                     "authority_conflicts": {"type": "string", "description": "Which courts take each side; whether the split is acknowledged; recency; CCA status. Empty string if none."},
                     "relevant_precedent": {"type": "string", "description": "Other cases, statutes, or principles cited in the opinion that frame the controversy. Empty string if none."},
-                    "pdr_score": {"type": "integer", "minimum": 1, "maximum": 10, "description": "1-3 routine; 4-5 arguable; 6-7 unsettled; 8-10 split/unresolved-constitutional/logical-flaw."}
+                    "pdr_score": {"type": "integer", "minimum": 1, "maximum": 10, "description": "1-3 routine; 4-5 arguable; 6-7 unsettled; 8-10 split/unresolved-constitutional/logical-flaw."},
+                    "matched_open_questions": {
+                        "type": "array",
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "id": {"type": "integer", "description": "Catalog open-question id from cca-judges catalog."},
+                                "explanation": {"type": "string", "description": "One-sentence explanation of how the COA opinion implicates the cataloged question."}
+                            },
+                            "required": ["id", "explanation"]
+                        },
+                        "description": "Optional. Cataloged CCA-flagged open questions whose resolution the opinion implicates."
+                    }
                 },
                 "required": ["headline", "issue_description", "discussion", "pdr_score"]
             }
@@ -113,6 +125,13 @@ def render_analysis_prose(text):
             lines.append(f"  Authority Conflicts: {issue['authority_conflicts']}")
         if issue.get("relevant_precedent"):
             lines.append(f"  Relevant Precedent: {issue['relevant_precedent']}")
+        matches = issue.get("matched_open_questions") or []
+        if matches:
+            lines.append("  Matched Open Questions:")
+            for mq in matches:
+                qid = mq.get("id", "?")
+                expl = mq.get("explanation", "")
+                lines.append(f"    [{qid}] {expl}")
         lines.append(f"  PDR Score: {issue.get('pdr_score', 0)}")
         lines.append("")
     lines.append(f"Issue Count: {count}")
@@ -358,14 +377,73 @@ class PDRBot:
         conn.close()
     
     def load_analysis_prompt(self):
-        """Load the analysis prompt from the pdrbot-prompt file"""
+        """Load the analysis prompt from the pdrbot-prompt file, then append
+        the current CCA open-questions catalog so the analyzer can flag
+        opinions that implicate questions current CCA judges have written
+        separately about."""
         prompt_file = Path("pdrbot-prompt")
         if prompt_file.exists():
-            return prompt_file.read_text().strip()
+            base = prompt_file.read_text().strip()
         else:
             logger.warning("pdrbot-prompt file not found, using default prompt")
-            return "Analyze this legal opinion for interesting legal issues."
-    
+            base = "Analyze this legal opinion for interesting legal issues."
+
+        catalog_path = Path(
+            "/home/ubuntu/github/cca-opinions/reports/special-interests/catalog.json"
+        )
+        if not catalog_path.exists():
+            logger.warning("open-questions catalog not found at %s — skipping",
+                           catalog_path)
+            return base
+
+        try:
+            catalog = json.loads(catalog_path.read_text())
+        except Exception as e:
+            logger.warning("could not parse catalog (%s) — skipping", e)
+            return base
+
+        questions = catalog.get("questions", [])
+        if not questions:
+            return base
+
+        lines = [
+            base,
+            "",
+            "## Known PDR-Worthy Open Questions (from CCA side opinions)",
+            "",
+            f"Texas Court of Criminal Appeals judges have flagged the "
+            f"following {len(questions)} open questions in concurrences and "
+            f"dissents (2015–present). These are issues a future PDR could "
+            f"pick up.",
+            "",
+            "When an issue you identify in the COA opinion implicates one or "
+            "more of these questions — the opinion's reasoning or holding "
+            "turns on the question's resolution, applies contested doctrine "
+            "the question targets, or sits in tension with how a CCA judge "
+            "has framed the question — populate the issue's "
+            "`matched_open_questions` array with the catalog id(s) and a "
+            "one-sentence explanation of how. A match is a strong "
+            "PDR-worthiness signal; multiple matches usually warrant a "
+            "higher PDR score. Catalog: " + catalog.get("source", "") + ".",
+            "",
+            "Catalog:",
+        ]
+        for q in questions:
+            examples = q.get("examples", []) or []
+            ex_bits = []
+            for ex in examples[:2]:
+                style = ex.get("case_style") or ""
+                cn = ex.get("case_number") or ""
+                ex_bits.append(f"{style}, {cn}" if style else cn)
+            ex_str = "; ".join(ex_bits) if ex_bits else ""
+            line = (
+                f"{q['id']}. [{q['judge']}] {q['question']}"
+                + (f" — example: {ex_str}" if ex_str else "")
+            )
+            lines.append(line)
+
+        return "\n".join(lines)
+
     @contextmanager
     def smtp_connection(self):
         """Context manager for SMTP connections"""
