@@ -8,8 +8,9 @@ an Anders/Gainous brief in a trial (non-plea) case, and checks whether:
      describes the evidence supporting each element.
   2. If not, whether the Anders brief itself did so.
 
-A daily heartbeat email is sent to mb@ivi3.com from andersproject@iacls.org
-summarizing the day's Anders findings: total opinions, Anders count, plea vs.
+A daily heartbeat email is sent to the recipients in TO_ADDRS from the
+authenticated EMAIL_FROM identity (PDRbot@iacls.org) summarizing the day's
+Anders findings: total opinions, Anders count, plea vs.
 trial split, and for trial cases whether the elements-and-evidence requirement
 was met by the opinion, by the brief, or neither. Deficient cases (and their
 brief PDFs as attachments) are included in the same email.
@@ -53,7 +54,10 @@ LOG = logging.getLogger('andersproject')
 
 DB_PATH = ROOT / 'data' / 'pdrbot.db'
 
-FROM_ADDR = 'andersproject@iacls.org'
+# Send from the identity the SMTP account actually authenticates as. Fastmail
+# rejects (551 5.7.1) outbound mail whose From header is not an authorised
+# identity on the account, and the account authenticates as EMAIL_FROM.
+FROM_ADDR = os.environ.get('EMAIL_FROM', 'PDRbot@iacls.org')
 TO_ADDRS = ['mb@ivi3.com', 'mcjernig@cougarnet.uh.edu']
 
 # ── Claude prompts ────────────────────────────────────────────────────────────
