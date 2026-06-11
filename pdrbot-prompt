@@ -36,4 +36,17 @@ Every factual claim must cite the opinion. Every issue must explain why it is no
 
 ## Output format (enforced by JSON schema)
 
-Return JSON matching the schema. Fields: `appellant_name`, `case_numbers` (array), `issues` (array of {headline, issue_description, discussion, authority_conflicts, relevant_precedent, pdr_score}), and `issue_count`. If there are no interesting issues, return `issues: []` and `issue_count: 0`.
+Return JSON matching the schema. Fields: `appellant_name`, `case_numbers` (array), `issues` (array of {headline, issue_description, discussion, authority_conflicts, relevant_precedent, pdr_score}), `issue_count`, `state_is_appellant`, and `disposition`. If there are no interesting issues, return `issues: []` and `issue_count: 0`.
+
+## Disposition and appellant identity (always required)
+
+Two top-level fields tell us who appealed and how the court ruled. Fill them in for every opinion, including ROUTINE-stub fall-throughs from triage.
+
+- `state_is_appellant` — `true` when the State of Texas is the appellant (the State, not the defendant, brought the appeal — e.g., State's appeal of a suppression order under article 44.01). `false` for ordinary defense appeals and for original proceedings styled "In re ...". When in doubt, check page 1 of the opinion: the appellant is named first.
+- `disposition` — one of: `affirmed`, `reversed`, `reversed_in_part`, `modified_and_affirmed`, `vacated`, `remanded`, `dismissed`, `petition_granted`, `petition_denied`, `abated`, `other`. Pick the value that captures the court's order for the appellant on the merits.
+  - `reversed` covers reversed-and-remanded, reversed-and-rendered, and reversed-and-acquitted.
+  - `reversed_in_part` only when the court reversed some counts/issues and affirmed others.
+  - `modified_and_affirmed` when the court modified the judgment (struck a fee, deleted a court cost, corrected the bill of costs) but the conviction stands.
+  - `dismissed` for jurisdictional dismissals (untimely notice, plea-bargain waiver, Anders dismissal).
+  - For mandamus / habeas original proceedings use `petition_granted` or `petition_denied`.
+  - Use `other` only when no listed value fits — do not guess.
