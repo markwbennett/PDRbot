@@ -104,6 +104,18 @@ if [ -x "scripts/backup_db.sh" ]; then
     fi
 fi
 
+# Check CCA hand-down pages for new PDR grants (ported from
+# tx-judicial-scraper/weekly; that service is retired). Non-fatal.
+log_message "Checking CCA hand-down pages for PDR grants..."
+if ./.venv/bin/python scripts/check_pdr_grants.py 2>&1 | tee -a "$LOG_FILE"; then
+    log_message "PDR grants check completed"
+else
+    log_message "WARNING: PDR grants check failed (exit $?)"
+    send_failure_alert \
+        "PDRBot: PDR grants check failed" \
+        "scripts/check_pdr_grants.py exited non-zero. Check the log: $(hostname):$(readlink -f \"$LOG_FILE\")"
+fi
+
 # Pre-flight: verify Claude CLI auth before running the full automation.
 # The OAuth token expires if no interactive Claude Code session has run
 # recently. A quick test call detects this early.
@@ -201,5 +213,22 @@ else
         "Calendar build exited $RC. See $(hostname):$(readlink -f \"$LOG_FILE\") Time: $(date '+%Y-%m-%d %H:%M:%S')"
 fi
 
+
+log_message "Regenerating slip-opinions HTML..."
+if ./.venv/bin/python scripts/generate_slip_opinions.py 2>&1 | tee -a "$LOG_FILE"; then
+    log_message "Slip-opinions HTML regenerated"
+else
+    RC=$?
+    log_message "WARNING: slip-opinions regeneration failed (exit $RC)"
+fi
+
+
+log_message "Regenerating triage HTML..."
+if ./.venv/bin/python scripts/generate_triage.py 2>&1 | tee -a "$LOG_FILE"; then
+    log_message "Triage HTML regenerated"
+else
+    RC=$?
+    log_message "WARNING: triage regeneration failed (exit $RC)"
+fi
 log_message "PDRBot daily automation finished"
 exit $EXIT_CODE

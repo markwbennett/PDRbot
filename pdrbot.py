@@ -42,6 +42,8 @@ from reportlab.lib.enums import TA_LEFT, TA_CENTER, TA_JUSTIFY
 # Add mwb_common to path
 sys.path.insert(0, os.path.expanduser('~/github/mwb_common'))
 from mwb_claude import call_claude_with_retry, get_current_model
+import case_styles  # noqa: E402  -- local sibling module
+import defense_wins  # noqa: E402  -- local sibling module
 
 # Set up logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
@@ -88,10 +90,43 @@ ANALYSIS_JSON_SCHEMA = {
                 "required": ["headline", "issue_description", "discussion", "pdr_score"]
             }
         },
-        "issue_count": {"type": "integer", "minimum": 0}
+        "issue_count": {"type": "integer", "minimum": 0},
+        "state_is_appellant": {
+            "type": "boolean",
+            "description": "True when the State of Texas is the appellant — i.e., the State, not the defendant, brought the appeal. False for ordinary defense appeals and for original proceedings styled \"In re ...\"."
+        },
+        "disposition": {
+            "type": "string",
+            "enum": [
+                "affirmed",
+                "reversed",
+                "reversed_in_part",
+                "modified_and_affirmed",
+                "vacated",
+                "remanded",
+                "dismissed",
+                "petition_granted",
+                "petition_denied",
+                "abated",
+                "other"
+            ],
+            "description": "Outcome the court of appeals ordered for the appellant. Use \"reversed\" for any judgment fully set aside (reversed-and-remanded, reversed-and-rendered, reversed-and-acquitted). Use \"reversed_in_part\" only when the court reversed some counts/issues and affirmed others. Use \"modified_and_affirmed\" when the court modified the judgment (e.g., struck a fee or court cost) but affirmed the conviction. Use \"vacated\" for a vacatur not styled as a reversal. Use \"dismissed\" for jurisdictional dismissals (untimely notice, Anders that becomes a dismissal, plea-bargain waiver dismissal). For mandamus or habeas original proceedings use \"petition_granted\" or \"petition_denied\". \"abated\" for abatements. \"other\" only when no listed value fits."
+        }
     },
     "required": ["appellant_name", "case_numbers", "issues", "issue_count"]
 }
+
+
+def _is_defense_win(disposition, state_is_appellant):
+    """Defense wins when the State appealed and lost (affirmance), or
+    when the defense appealed and won (any flavor of reversal/vacatur).
+    Returns False for unknown or mixed dispositions; the stamp is
+    intentionally conservative."""
+    if disposition is None or state_is_appellant is None:
+        return False
+    if state_is_appellant:
+        return disposition == "affirmed"
+    return disposition in ("reversed", "reversed_in_part", "vacated")
 
 
 def render_analysis_prose(text):
@@ -115,6 +150,20 @@ def render_analysis_prose(text):
     nums = ", ".join(data.get("case_numbers", []) or [])
     if name or nums:
         lines.append(f"Appellant: {name}" + (f"  Case No.: {nums}" if nums else ""))
+        lines.append("")
+    disp = data.get("disposition")
+    state_app = data.get("state_is_appellant")
+    if disp or state_app is not None:
+        bits = []
+        if disp:
+            bits.append(f"Disposition: {disp}")
+        if state_app is True:
+            bits.append("Appellant: State")
+        elif state_app is False:
+            bits.append("Appellant: defendant")
+        if _is_defense_win(disp, state_app):
+            bits.append("DEFENSE WIN")
+        lines.append("  ·  ".join(bits))
         lines.append("")
     for i, issue in enumerate(data.get("issues", []) or [], 1):
         lines.append(f"Issue {i}:")
@@ -747,6 +796,18 @@ class PDRBot:
             # Extract PDR score
             pdr_score = self.extract_pdr_score(cleaned_text)
 
+            # Extract cached disposition / state_is_appellant fields from
+            # JSON-form analyses so the slip-opinions and triage renderers
+            # can stamp defense wins without re-parsing analysis_text.
+            disposition_val = None
+            state_is_appellant_val = None
+            _parsed_meta = parse_analysis_json(cleaned_text)
+            if _parsed_meta is not None:
+                if isinstance(_parsed_meta.get("disposition"), str):
+                    disposition_val = _parsed_meta["disposition"]
+                if isinstance(_parsed_meta.get("state_is_appellant"), bool):
+                    state_is_appellant_val = 1 if _parsed_meta["state_is_appellant"] else 0
+
             # Get the file_path for this opinion
             cursor.execute('SELECT file_path FROM opinions WHERE id = ?', (opinion_id,))
             result = cursor.fetchone()
@@ -765,10 +826,12 @@ class PDRBot:
                 cursor.execute('''
                     INSERT OR REPLACE INTO analysis
                     (opinion_id, case_number, court, opinion_date, analysis_text,
-                     has_interesting_issues, issue_count, claude_model, pdr_score)
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                     has_interesting_issues, issue_count, claude_model, pdr_score,
+                     disposition, state_is_appellant)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ''', (oid, cnum, crt, odate, cleaned_text,
-                      has_interesting_issues, issue_count, self.claude_model, pdr_score))
+                      has_interesting_issues, issue_count, self.claude_model, pdr_score,
+                      disposition_val, state_is_appellant_val))
 
             if len(all_opinions) > 1:
                 logger.info(f"Saved analysis to {len(all_opinions)} consolidated cases sharing {file_path}")
@@ -1906,13 +1969,23 @@ class PDRBot:
         
         try:
             cursor.execute('''
-                INSERT OR IGNORE INTO opinions 
+                INSERT OR IGNORE INTO opinions
                 (case_number, court, opinion_date, opinion_type, justice_name, filename, file_path, case_url, pdf_url)
                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
             ''', (case_number, court, opinion_date, opinion_type, justice_name, filename, file_path, case_url, pdf_url))
-            
+
             conn.commit()
-            return cursor.rowcount > 0
+            inserted = cursor.rowcount > 0
+            # When a new opinion row appears for a case we haven't seen
+            # before, scrape its style off search.txcourts.gov so the
+            # slip-opinions page can show the caption. Failures are
+            # non-fatal; the row is cached either way for later retry.
+            try:
+                case_styles.ensure_table(conn)
+                case_styles.get_or_fetch_style(conn, case_number)
+            except Exception as e:
+                logger.warning(f"case_styles fetch failed for {case_number}: {e}")
+            return inserted
         except Exception as e:
             logger.error(f"Error saving to database: {e}")
             return False
@@ -2189,8 +2262,12 @@ class PDRBot:
             logger.error(f"Error generating prompt PDF: {e}")
             return None
 
-    def _build_email_html(self, target_date, results, interesting_count):
-        """Build HTML email body with case cards and direct links."""
+    def _build_email_html(self, target_date, results, interesting_count, wins=None):
+        """Build HTML email body with case cards and direct links.
+
+        wins: list of defense-win dicts from defense_wins.collect_defense_wins(),
+        rendered as a green section at the top of the email."""
+        wins = wins or []
         # Build case cards
         case_cards_html = ""
         if interesting_count > 0:
@@ -2251,11 +2328,45 @@ class PDRBot:
                     <div style="margin-top:4px;font-size:12px;">{link_html}</div>
                 </td></tr>"""
 
+        # Defense-wins section (top of the email).
+        wins_html = ""
+        if wins:
+            win_cards = ""
+            for w in wins:
+                links = (
+                    f'<a href="{w["case_url"]}" style="color:#1e8449;text-decoration:none;">Case page</a>'
+                )
+                if w.get("pdf_url"):
+                    links += (
+                        f' &middot; <a href="{w["pdf_url"]}" '
+                        f'style="color:#1e8449;text-decoration:none;">Opinion PDF</a>'
+                    )
+                win_cards += f'''
+                <tr><td style="padding:10px 16px;border-bottom:1px solid #d5e8d4;background:#f4faf4;">
+                    <div style="font-size:15px;font-weight:bold;color:#145a32;">{w['style']}</div>
+                    <div style="margin-top:2px;font-size:13px;color:#333;">{w['case_number']}
+                        <span style="color:#666;">({w['court']}, {w['date']})</span>
+                        <span style="display:inline-block;background:#1e8449;color:#fff;font-weight:bold;padding:2px 8px;border-radius:3px;font-size:12px;margin-left:8px;">{w['disposition']}</span>
+                    </div>
+                    <div style="margin-top:4px;font-size:12px;">{links}</div>
+                </td></tr>'''
+            wins_html = f'''
+    <tr><td style="padding:12px 24px;background:#eaf7ea;border-bottom:1px solid #d5e8d4;">
+        <div style="font-size:16px;font-weight:bold;color:#145a32;">&#127942; Defense Wins</div>
+    </td></tr>
+    <tr><td style="padding:0;">
+        <table width="100%" cellpadding="0" cellspacing="0">
+            {win_cards}
+        </table>
+    </td></tr>'''
+
         # Assemble full HTML
         if interesting_count > 0:
             summary_line = f"{interesting_count} case{'s' if interesting_count != 1 else ''} with interesting issues"
         else:
             summary_line = "No interesting issues identified"
+        if not wins:
+            summary_line += ' <span style="color:#888;">&middot; no new defense wins</span>'
 
         html = f"""<!DOCTYPE html>
 <html><head><meta charset="utf-8"></head>
@@ -2264,7 +2375,7 @@ class PDRBot:
     <tr><td style="background:#1a1a2e;padding:20px 24px;">
         <div style="color:#ffffff;font-size:20px;font-weight:bold;">PDRBot Daily Report</div>
         <div style="color:#aaa;font-size:14px;margin-top:4px;">{target_date}</div>
-    </td></tr>
+    </td></tr>{wins_html}
     <tr><td style="padding:16px 24px;background:#f8f8f8;border-bottom:1px solid #ddd;">
         <div style="font-size:15px;color:#333;">{summary_line}</div>
     </td></tr>
@@ -2284,8 +2395,19 @@ class PDRBot:
 </body></html>"""
         return html
 
-    def _build_email_plain(self, target_date, results, interesting_count):
+    def _build_email_plain(self, target_date, results, interesting_count, wins=None):
         """Build plain-text fallback email body."""
+        wins = wins or []
+        if wins:
+            wins_section = "DEFENSE WINS\n\n"
+            for w in wins:
+                wins_section += (
+                    f"  {w['style']}\n"
+                    f"    {w['case_number']} ({w['court']}, {w['date']}) -- {w['disposition']}\n"
+                    f"    {w['case_url']}\n\n"
+                )
+        else:
+            wins_section = "No new defense wins on the COA dockets.\n\n"
         if interesting_count > 0:
             cases_section = f"{interesting_count} case(s) with interesting issues:\n\n"
             for result in results:
@@ -2315,7 +2437,7 @@ class PDRBot:
 
         return f"""PDRBot Daily Report for {target_date}
 
-{cases_section}
+{wins_section}{cases_section}
 Full analysis is in the attached PDF report.
 
 PDRBot runs at 9:10 a.m. Opinions released after that will appear in the next day's report.
@@ -2357,6 +2479,13 @@ To unsubscribe, reply with 'unsubscribe' in the subject or body.
             results = self.get_analysis_results(date_filter=target_date, interesting_only=True)
         interesting_count = len(results)
 
+        # Defense wins from the COA dockets (ported from tx-judicial-scraper).
+        try:
+            wins, wins_state = defense_wins.collect_defense_wins()
+        except Exception as exc:
+            logger.warning(f"Defense-wins docket check failed: {exc}")
+            wins, wins_state = [], None
+
         # Subject line: show count + up to three top headlines.
         if interesting_count == 0:
             interesting_text = "no interesting issues"
@@ -2380,9 +2509,12 @@ To unsubscribe, reply with 'unsubscribe' in the subject or body.
                 combined = f"{subject}: {suffix}"
                 subject = combined if len(combined) <= 180 else combined[:177] + "..."
 
+        if wins:
+            subject = f"{len(wins)} defense win{'s' if len(wins) != 1 else ''}\u2014{subject}"
+
         # Build email content
-        html_body = self._build_email_html(target_date, results, interesting_count)
-        plain_body = self._build_email_plain(target_date, results, interesting_count)
+        html_body = self._build_email_html(target_date, results, interesting_count, wins=wins)
+        plain_body = self._build_email_plain(target_date, results, interesting_count, wins=wins)
 
         # Read report attachment once (may be absent if PDF generation failed).
         report_data = None
@@ -2442,6 +2574,11 @@ To unsubscribe, reply with 'unsubscribe' in the subject or body.
 
             if successful_sends > 0:
                 logger.info(f"Sent emails to {successful_sends}/{len(all_recipients)} recipients")
+                if wins and wins_state is not None:
+                    try:
+                        defense_wins.mark_reported(wins_state, wins)
+                    except Exception as exc:
+                        logger.warning(f"Failed to persist defense-wins state: {exc}")
                 return True
             else:
                 logger.error("Failed to send email to any recipients")
