@@ -158,7 +158,7 @@ class COAOpinionScraper:
                 response.raise_for_status()
                 
                 # Validate response is actually a PDF
-                if response.headers.get('content-type', '').lower() != 'application/pdf':
+                if not response.headers.get('content-type', '').lower().startswith('application/pdf'):
                     logger.warning(f"Response is not a PDF (attempt {attempt + 1}): {response.headers.get('content-type', 'unknown')}")
                     if attempt == max_retries - 1:
                         logger.error(f"Not a PDF after {max_retries} attempts: {filename}")
