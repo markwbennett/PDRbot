@@ -1005,7 +1005,7 @@ class PDRBot:
                             INSERT INTO opinions 
                             (case_number, court, opinion_date, opinion_type, filename, file_path, case_url)
                             VALUES (?, ?, ?, ?, ?, ?, ?)
-                        ''', (case_number, court, opinion_date, "combined", filename, pdf_path, ""))
+                        ''', (case_number, court, opinion_date, "combined", os.path.basename(pdf_path), pdf_path, ""))
                         opinion_id = cursor.lastrowid
                         conn.commit()
                     else:
