@@ -44,7 +44,7 @@ ROOT = Path(__file__).resolve().parent
 sys.path.insert(0, str(ROOT))
 sys.path.insert(0, os.path.expanduser('~/github/mwb_common'))
 
-from mwb_claude import call_claude
+from mwb_claude import call_claude, call_claude_ex
 
 logging.basicConfig(
     level=logging.INFO,
@@ -260,6 +260,20 @@ def fetch_anders_brief(case_number: str, court: str) -> tuple[str | None, Path |
 # ── Claude calls ──────────────────────────────────────────────────────────────
 
 def _parse_json(text: str) -> dict:
+    # Prefer the outermost balanced object (first '{' .. last '}'). This handles
+    # a brace appearing inside a string value (e.g. the "notes" field), which the
+    # old brace-free regex `\{[^{}]*\}` would refuse to match, silently dropping
+    # an otherwise-valid verdict to {} — and, for the brief judgment, to a
+    # spurious null rather than the model's real True/False.
+    start = text.find('{')
+    end = text.rfind('}')
+    if start != -1 and end > start:
+        try:
+            return json.loads(text[start:end + 1])
+        except json.JSONDecodeError:
+            pass
+    # Fallback: the original brace-free match, in case the outer slice spans two
+    # separate objects (e.g. a prose reply that happens to contain stray braces).
     m = re.search(r'\{[^{}]*\}', text, re.DOTALL)
     if m:
         try:
@@ -275,11 +289,17 @@ def analyze_opinion(pdf_path: Path) -> dict:
     if not text:
         return {}
     try:
-        raw = call_claude(OPINION_PROMPT + text, timeout=120)
-        return _parse_json(raw)
+        raw, model_used = call_claude_ex(OPINION_PROMPT + text, timeout=120)
     except Exception as e:
         LOG.warning('Claude opinion analysis failed: %s', e)
         return {}
+    result = _parse_json(raw)
+    if result:
+        # Record the model that actually answered — call_claude_ex falls
+        # CLI(Opus)→SDK(Opus)→Grok, and a silent downgrade to Grok must be
+        # visible rather than masked by a hardcoded model string.
+        result['_model'] = model_used
+    return result
 
 
 def analyze_brief(pdf_path: Path) -> dict:
@@ -287,11 +307,14 @@ def analyze_brief(pdf_path: Path) -> dict:
     if not text:
         return {}
     try:
-        raw = call_claude(BRIEF_PROMPT + text, timeout=120)
-        return _parse_json(raw)
+        raw, model_used = call_claude_ex(BRIEF_PROMPT + text, timeout=120)
     except Exception as e:
         LOG.warning('Claude brief analysis failed: %s', e)
         return {}
+    result = _parse_json(raw)
+    if result:
+        result['_model'] = model_used
+    return result
 
 
 # ── Core analysis loop ────────────────────────────────────────────────────────
@@ -322,13 +345,17 @@ def process_opinion(conn: sqlite3.Connection, row: tuple, reanalyze: bool = Fals
     opinion_lists = result.get('opinion_lists_elements')
     offense_name = result.get('offense_name')
     notes = result.get('notes', '')
+    op_model = result.get('_model')
 
-    LOG.info('  is_anders=%s is_trial=%s opinion_lists_elements=%s',
-             is_anders, is_trial, opinion_lists)
+    LOG.info('  is_anders=%s is_trial=%s opinion_lists_elements=%s (model=%s)',
+             is_anders, is_trial, opinion_lists, op_model)
 
     brief_lists = None
     brief_url = None
     brief_pdf_path = None
+    # Every model that answered a brief judgment for this case, in order — so the
+    # stored provenance shows if any brief verdict came from a fallback (Grok).
+    brief_models: list = []
 
     # If Anders and is_trial ambiguous from opinion, consult the brief
     if is_anders and is_trial is None:
@@ -337,12 +364,14 @@ def process_opinion(conn: sqlite3.Connection, row: tuple, reanalyze: bool = Fals
         if brief_pdf:
             brief_pdf_path = str(brief_pdf)
             br = analyze_brief(brief_pdf)
+            brief_models.append(br.get('_model'))
             resolved = br.get('is_trial')
             if resolved is not None:
                 is_trial = resolved
                 LOG.info('  is_trial resolved from brief: %s', is_trial)
             brief_lists = br.get('brief_lists_elements')
-            LOG.info('  brief_lists_elements=%s', brief_lists)
+            LOG.info('  brief_lists_elements=%s (model=%s)',
+                     brief_lists, br.get('_model'))
         else:
             LOG.info('  Anders brief not found or not downloadable')
         time.sleep(1.0)
@@ -354,11 +383,57 @@ def process_opinion(conn: sqlite3.Connection, row: tuple, reanalyze: bool = Fals
         if brief_pdf:
             brief_pdf_path = str(brief_pdf)
             br = analyze_brief(brief_pdf)
+            brief_models.append(br.get('_model'))
             brief_lists = br.get('brief_lists_elements')
-            LOG.info('  brief_lists_elements=%s', brief_lists)
+            LOG.info('  brief_lists_elements=%s (model=%s)',
+                     brief_lists, br.get('_model'))
         else:
             LOG.info('  Anders brief not found or not downloadable')
         time.sleep(1.0)
+
+    # Verify before flagging DEFICIENT. A DEFICIENT flag publicly accuses a named
+    # appointed attorney and the court, so a single brief judgment is too weak to
+    # rest it on — one flaky sample, or a silent fallback to Grok during an Opus
+    # outage, produced exactly that false positive on 02-25-00442-CR (Criminal
+    # Trespass), whose brief does recite the elements and the supporting evidence.
+    # When the cheap first pass would flag (opinion False + brief False), re-run
+    # the brief judgment to best-of-3 and require a majority of explicit False
+    # votes to stand. A tie, a majority True, or unparseable votes clear the flag.
+    if (is_anders and is_trial and opinion_lists is False
+            and brief_lists is False and brief_pdf_path):
+        brief_pdf = Path(brief_pdf_path)
+        false_votes = 1  # the first pass already returned False
+        true_votes = 0
+        for _ in range(2):
+            time.sleep(1.0)
+            br = analyze_brief(brief_pdf)
+            brief_models.append(br.get('_model'))
+            v = br.get('brief_lists_elements')
+            if v is True:
+                true_votes += 1
+            elif v is False:
+                false_votes += 1
+        if false_votes >= 2:
+            brief_lists = False
+            LOG.info('  brief DEFICIENT confirmed (%d False / %d True of 3); '
+                     'models=%s', false_votes, true_votes, brief_models)
+        else:
+            brief_lists = True
+            LOG.info('  brief NOT deficient on re-check (%d False / %d True of 3);'
+                     ' clearing flag; models=%s',
+                     false_votes, true_votes, brief_models)
+
+    # Provenance of the models that actually answered — replaces the old
+    # hardcoded 'claude-opus-4-7', which lied whenever the chain fell back.
+    def _fmt_models(models: list) -> str:
+        seen = [m for m in models if m]
+        # de-dup preserving order
+        uniq = list(dict.fromkeys(seen))
+        return '+'.join(uniq) if uniq else 'unknown'
+
+    model_provenance = f"opinion={_fmt_models([op_model])}"
+    if brief_models:
+        model_provenance += f" brief={_fmt_models(brief_models)}"
 
     # Upsert analysis record
     if existing and reanalyze:
@@ -367,14 +442,15 @@ def process_opinion(conn: sqlite3.Connection, row: tuple, reanalyze: bool = Fals
                is_anders=?, is_trial=?, opinion_lists_elements=?,
                brief_lists_elements=?, brief_url=?, brief_pdf_path=?,
                offense_name=?, notes=?, analyzed_at=datetime('now','localtime'),
-               model='claude-opus-4-7'
+               model=?
                WHERE opinion_id=?''',
             (
                 int(is_anders) if is_anders is not None else None,
                 int(is_trial) if is_trial is not None else None,
                 int(opinion_lists) if opinion_lists is not None else None,
                 int(brief_lists) if brief_lists is not None else None,
-                brief_url, brief_pdf_path, offense_name, notes, op_id,
+                brief_url, brief_pdf_path, offense_name, notes,
+                model_provenance, op_id,
             ),
         )
     else:
@@ -392,7 +468,7 @@ def process_opinion(conn: sqlite3.Connection, row: tuple, reanalyze: bool = Fals
                 int(opinion_lists) if opinion_lists is not None else None,
                 int(brief_lists) if brief_lists is not None else None,
                 brief_url, brief_pdf_path, offense_name, notes,
-                'claude-opus-4-7',
+                model_provenance,
             ),
         )
     conn.commit()
