@@ -44,6 +44,7 @@ sys.path.insert(0, os.path.expanduser('~/github/mwb_common'))
 from mwb_claude import call_claude_with_retry, get_current_model
 import case_styles  # noqa: E402  -- local sibling module
 import defense_wins  # noqa: E402  -- local sibling module
+import brief_harvest  # noqa: E402  -- local sibling module
 
 # Set up logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
@@ -2341,6 +2342,18 @@ class PDRBot:
                         f' &middot; <a href="{w["pdf_url"]}" '
                         f'style="color:#1e8449;text-decoration:none;">Opinion PDF</a>'
                     )
+                counsel_html = ""
+                for c in w.get("counsel", []):
+                    parts = [c["name"]]
+                    if c.get("bar_number"):
+                        parts.append(f"SBOT {c['bar_number']}")
+                    if c.get("email"):
+                        parts.append(
+                            f'<a href="mailto:{c["email"]}" '
+                            f'style="color:#1e8449;">{c["email"]}</a>')
+                    counsel_html += (
+                        f'<div style="margin-top:2px;font-size:12px;color:#333;">'
+                        f'&#9878;&#65039; {" &middot; ".join(parts)}</div>')
                 win_cards += f'''
                 <tr><td style="padding:10px 16px;border-bottom:1px solid #d5e8d4;background:#f4faf4;">
                     <div style="font-size:15px;font-weight:bold;color:#145a32;">{w['style']}</div>
@@ -2348,6 +2361,7 @@ class PDRBot:
                         <span style="color:#666;">({w['court']}, {w['date']})</span>
                         <span style="display:inline-block;background:#1e8449;color:#fff;font-weight:bold;padding:2px 8px;border-radius:3px;font-size:12px;margin-left:8px;">{w['disposition']}</span>
                     </div>
+                    {counsel_html}
                     <div style="margin-top:4px;font-size:12px;">{links}</div>
                 </td></tr>'''
             wins_html = f'''
@@ -2404,8 +2418,15 @@ class PDRBot:
                 wins_section += (
                     f"  {w['style']}\n"
                     f"    {w['case_number']} ({w['court']}, {w['date']}) -- {w['disposition']}\n"
-                    f"    {w['case_url']}\n\n"
                 )
+                for c in w.get("counsel", []):
+                    bits = [c["name"]]
+                    if c.get("bar_number"):
+                        bits.append(f"SBOT {c['bar_number']}")
+                    if c.get("email"):
+                        bits.append(c["email"])
+                    wins_section += f"    Winning counsel: {' -- '.join(bits)}\n"
+                wins_section += f"    {w['case_url']}\n\n"
         else:
             wins_section = "No new defense wins on the COA dockets.\n\n"
         if interesting_count > 0:
@@ -2448,7 +2469,8 @@ Source: https://github.com/markwbennett/PDRbot
 To unsubscribe, reply with 'unsubscribe' in the subject or body.
 """
 
-    def send_email_report(self, report_path, target_date, date_range=None):
+    def send_email_report(self, report_path, target_date, date_range=None,
+                          wins=None, wins_state=None):
         """Send email with PDF report attachment
 
         Args:
@@ -2480,11 +2502,19 @@ To unsubscribe, reply with 'unsubscribe' in the subject or body.
         interesting_count = len(results)
 
         # Defense wins from the COA dockets (ported from tx-judicial-scraper).
-        try:
-            wins, wins_state = defense_wins.collect_defense_wins()
-        except Exception as exc:
-            logger.warning(f"Defense-wins docket check failed: {exc}")
-            wins, wins_state = [], None
+        # run_daily_automation scrapes wins once and passes them in so the
+        # docket is not fetched twice; fall back to scraping here when called
+        # directly (e.g. the resume path) without pre-scraped wins.
+        if wins is None:
+            try:
+                wins, wins_state = defense_wins.collect_defense_wins()
+            except Exception as exc:
+                logger.warning(f"Defense-wins docket check failed: {exc}")
+                wins, wins_state = [], None
+            # Harvest winning counsel's name/bar number/email from their
+            # briefs; adds win["counsel"] in place and upserts into the
+            # lawyer_contacts table. Never raises.
+            brief_harvest.enrich_wins(wins, self.db_path)
 
         # Subject line: show count + up to three top headlines.
         if interesting_count == 0:
@@ -2887,14 +2917,36 @@ To unsubscribe, reply with 'unsubscribe' in the subject or body.
                         logger.error(f"generate_analysis_report raised: {exc}")
                     report_date_label = f"{range_start} to {range_end}"
 
-            if not report_path and report_generation_error is None:
-                # Genuine no-cases state — nothing interesting to report.
-                # This is not a failure: the automation ran cleanly, there
+            # Defense-wins docket scrape runs on EVERY execution, independent
+            # of whether there is an interesting opinion to email. A win that
+            # posts after a morning run, or lands on a day with no interesting
+            # opinions, must still go out. Scrape once here and hand the result
+            # to send_email_report so the docket is not fetched twice.
+            try:
+                wins, wins_state = defense_wins.collect_defense_wins()
+            except Exception as exc:
+                logger.warning(f"Defense-wins docket check failed: {exc}")
+                wins, wins_state = [], None
+            # Harvest winning counsel's name/bar number/email from their
+            # briefs; adds win["counsel"] in place and upserts into the
+            # lawyer_contacts table. Never raises.
+            brief_harvest.enrich_wins(wins, self.db_path)
+
+            if not report_path and report_generation_error is None and not wins:
+                # Genuine no-cases state — no interesting opinions AND no new
+                # defense wins. Not a failure: the automation ran cleanly, there
                 # was just nothing worth emailing. Return True so the wrapper
                 # script does not send a spurious failure alert.
                 self.update_run_state(run_id, status='no_cases')
-                logger.info("No report generated (no interesting cases found)")
+                logger.info("No report generated (no interesting cases or defense wins)")
                 return True
+
+            if not report_path and report_generation_error is None:
+                # No interesting opinions, but defense wins are pending: send a
+                # wins-only email (no PDF attachment).
+                logger.info(
+                    f"No interesting cases for {date_str}, but "
+                    f"{len(wins)} new defense win(s); sending wins-only email")
 
             if report_generation_error is not None:
                 # PDF generation crashed but analyses succeeded — send email
@@ -2912,7 +2964,8 @@ To unsubscribe, reply with 'unsubscribe' in the subject or body.
                 logger.info("Step 5: Sending email...")
                 self.update_run_state(run_id, status='emailing')
                 email_success = self.send_email_report(
-                    report_path, report_date_label, date_range=report_date_range)
+                    report_path, report_date_label, date_range=report_date_range,
+                    wins=wins, wins_state=wins_state)
                 
                 if email_success:
                     self.update_run_state(run_id, status='completed')
