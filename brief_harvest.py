@@ -1,29 +1,37 @@
 #!/usr/bin/env python3
-"""Harvest winning defense counsel's contact info from their COA briefs.
+"""Harvest defense counsel's contact info from COA briefs.
 
-For each defense win found by defense_wins.py, this module:
+For each criminal case handed in (defense wins, interesting opinions,
+or any other case dict with a case_url), this module:
 
-  1. Fetches the TAMES case page (Case.aspx) for the win.
+  1. Fetches the TAMES case page (Case.aspx).
   2. Reads the Parties panel to get the defense side's representative
      names (the State's parties are skipped).
   3. Reads the Appellate Briefs panel and downloads the brief PDFs the
      defense side filed (filed-by "Appellant" when the defendant
      appealed, "Appellee" when the State appealed).
-  4. Extracts text with pdftotext and pulls (name, bar number, email)
-     from the signature block. A contact is kept only when its
-     surrounding text names one of the defense representatives from the
-     Parties panel -- this keeps certificate-of-service emails for
-     opposing counsel out of the table.
-  5. Upserts the contacts into the lawyer_contacts table in pdrbot.db
+  4. Extracts text with pdftotext and pulls (name, bar number, email).
+     Sources include signature blocks, identity/list of parties, and
+     the eFileTexas automated Certificate of eService (often the last
+     page of a filed brief). A contact is kept only when its surrounding
+     text names one of the defense representatives from the Parties
+     panel -- prosecutor/State service addresses drop out the same way.
+  5. If no defense-counsel email is found (no defense brief, or the
+     brief lacks an email), downloads the State's first brief and mines
+     it the same way. The State's automated Certificate of eService is
+     treated as a source of truth for who was served (defense counsel).
+  6. Upserts the contacts into the lawyer_contacts table in pdrbot.db
      and refreshes data/lawyer_contacts.csv.
 
 Entry point for pdrbot.py:
 
-    brief_harvest.enrich_wins(wins, db_path)
+    brief_harvest.enrich_cases(cases, db_path)
 
-which adds a "counsel" list ({name, bar_number, email}) to each win
+which adds a "counsel" list ({name, bar_number, email}) to each case
 dict in place, saves new contacts, and never raises -- any failure is
-logged and the win is passed through unenriched.
+logged and the case is passed through unenriched.
+
+`enrich_wins` is kept as an alias of `enrich_cases` for older callers.
 
 CLI (for testing):
     brief_harvest.py --case 02-25-00166-CR --coa 2 [--state-appealed]
@@ -59,22 +67,14 @@ BAR_NO_RE = re.compile(
 )
 # Lines above an email in which we look for the bar number and the name.
 SIG_WINDOW = 14
-COS_HEADING_RE = re.compile(r"certificate\s+of\s+service", re.IGNORECASE)
-# An email this close below a Certificate of Service heading is a
-# service address (usually opposing counsel's), never signature block.
-COS_ZONE = 12
 # Lines marking the State's counsel block on the identity-of-parties
-# page or in a certificate of service.
+# page or in a certificate of service. Used so a prosecutor email in a
+# State signature block (or a defense brief's COS listing the State) is
+# not attributed to a defense representative.
 STATE_MARKER_RE = re.compile(
     r"(?:attorney|counsel)s?\s+for\s+the\s+state|district\s+attorney"
     r"|county\s+attorney|attorney\s+pro\s+tem|state\s+prosecuting\s+attorney"
     r"|state\s+of\s+texas",
-    re.IGNORECASE,
-)
-# Pages that are eFileTexas envelope/service sheets (appended to filed
-# PDFs) list every service contact on both sides -- never harvest them.
-EFILE_SHEET_RE = re.compile(
-    r"Automated Certificate of eService|Envelope ID:|Filing Code Description",
     re.IGNORECASE,
 )
 
@@ -122,12 +122,13 @@ def parse_defense_reps(soup: BeautifulSoup) -> list[str]:
     return reps
 
 
-def parse_defense_brief_links(soup: BeautifulSoup, defense_label: str) -> list[dict]:
-    """Brief PDF links filed by the defense side.
+def parse_brief_links(soup: BeautifulSoup, filed_by_label: str) -> list[dict]:
+    """Brief PDF links filed by the given side.
 
-    defense_label: "Appellant" or "Appellee". Rows in the Appellate
+    filed_by_label: "Appellant" or "Appellee". Rows in the Appellate
     Briefs panel carry a filed-by cell; nested media rows (which repeat
     the links without a date) are skipped by requiring a date cell.
+    Returned in table order (TAMES chronological ascending).
     """
     table = _panel_table(soup, "Appellate Briefs")
     if table is None:
@@ -140,7 +141,7 @@ def parse_defense_brief_links(soup: BeautifulSoup, defense_label: str) -> list[d
         if not texts or not re.match(r"\d{2}/\d{2}/\d{4}", texts[0]):
             continue  # nested media sub-row, not a filing row
         filed_by = texts[2] if len(texts) > 2 else ""
-        if defense_label.lower() not in filed_by.lower():
+        if filed_by_label.lower() not in filed_by.lower():
             continue
         for a in row.find_all("a"):
             href = a.get("href", "")
@@ -154,16 +155,45 @@ def parse_defense_brief_links(soup: BeautifulSoup, defense_label: str) -> list[d
     return briefs
 
 
+def parse_defense_brief_links(soup: BeautifulSoup, defense_label: str) -> list[dict]:
+    """Alias: brief PDF links filed by the defense side."""
+    return parse_brief_links(soup, defense_label)
+
+
+def _first_brief(briefs: list[dict]) -> dict | None:
+    """Earliest-filed brief (MM/DD/YYYY dates from TAMES)."""
+    if not briefs:
+        return None
+
+    def _key(b: dict):
+        try:
+            return time.strptime(b["date"], "%m/%d/%Y")
+        except (KeyError, ValueError):
+            return time.strptime("01/01/1900", "%m/%d/%Y")
+
+    return min(briefs, key=_key)
+
+
 def download_brief(url: str, case_number: str, date: str,
-                   session: requests.Session | None = None) -> Path | None:
-    """Download a brief PDF into data/briefs/<case>/; return the path."""
+                   session: requests.Session | None = None,
+                   tag: str = "brief") -> Path | None:
+    """Download a brief PDF into data/briefs/<case>/; return the path.
+
+    tag disambiguates side/source (e.g. "defense", "state") so a State
+    brief filed the same day as a defense brief does not overwrite it.
+    """
     sess = session or requests
     case_dir = BRIEFS_DIR / case_number
     case_dir.mkdir(parents=True, exist_ok=True)
-    fname = f"{case_number}_{date.replace('/', '-')}_brief.pdf"
+    safe_tag = re.sub(r"[^A-Za-z0-9_-]+", "", tag) or "brief"
+    fname = f"{case_number}_{date.replace('/', '-')}_{safe_tag}.pdf"
     path = case_dir / fname
+    # Legacy name (pre-tag) so re-runs reuse previously cached defense PDFs.
+    legacy = case_dir / f"{case_number}_{date.replace('/', '-')}_brief.pdf"
     if path.exists() and path.stat().st_size > 0:
         return path
+    if safe_tag == "defense" and legacy.exists() and legacy.stat().st_size > 0:
+        return legacy
     try:
         resp = sess.get(url, headers=UA, timeout=120)
         resp.raise_for_status()
@@ -194,21 +224,24 @@ def pdf_to_text(pdf_path: Path) -> str:
 def harvest_contacts(text: str, defense_reps: list[str]) -> list[dict]:
     """Pull (name, bar_number, email) for defense reps from brief text.
 
-    Signature blocks and identity-of-parties entries put the lawyer's
-    name (then bar number, address) ABOVE the email, so each email is
-    attributed by scanning upward. The scan keeps a contact only when a
-    defense representative's name is found closer above the email than
-    any State-side marker line ("District Attorney," "Attorney for the
-    State," etc.) -- on the identity-of-parties page both sides' blocks
-    are stacked, and nearest-marker-wins separates them. The bar number
-    is taken only from the lines between the name and the email, so a
-    neighboring block's number is never borrowed. Emails just below a
-    Certificate of Service heading are skipped outright.
+    Signature blocks, identity-of-parties entries, and the eFileTexas
+    automated Certificate of eService put the lawyer's name (then bar
+    number / address / service line) ABOVE or beside the email, so each
+    email is attributed by scanning upward. The scan keeps a contact
+    only when a defense representative's name is found closer above the
+    email than any State-side marker line ("District Attorney,"
+    "Attorney for the State," etc.). Nearest-marker-wins separates
+    stacked blocks on identity-of-parties pages and keeps prosecutor
+    addresses out of a defense brief's COS. The bar number is taken only
+    from the lines between the name and the email.
+
+    Certificate of Service pages are intentionally mined: on a State
+    brief the auto-generated eService certificate is a source of truth
+    for defense counsel's service email.
     """
-    # Drop eFile envelope/service-sheet pages before line-level parsing.
-    kept_pages = [p for p in text.split("\f") if not EFILE_SHEET_RE.search(p)]
-    lines = "\n".join(kept_pages).splitlines()
-    cos_lines = [i for i, ln in enumerate(lines) if COS_HEADING_RE.search(ln)]
+    # Keep every page, including the trailing Automated Certificate of
+    # eService sheet (form-feed separates PDF pages in pdftotext output).
+    lines = text.splitlines()
     contacts: dict[str, dict] = {}  # keyed by email lower
 
     def _norm(s: str) -> str:
@@ -234,8 +267,6 @@ def harvest_contacts(text: str, defense_reps: list[str]) -> list[dict]:
     for i, line in enumerate(lines):
         for email_m in EMAIL_RE.finditer(line):
             email = email_m.group(0).strip(".")
-            if any(0 <= i - c <= COS_ZONE for c in cos_lines):
-                continue  # inside a Certificate of Service section
 
             matched_rep = None
             rep_dist = None
@@ -245,9 +276,10 @@ def harvest_contacts(text: str, defense_reps: list[str]) -> list[dict]:
                 if j < 0:
                     break
                 ln_lower = _norm(lines[j])
-                # An email more than two lines up means we crossed into
-                # a different counsel block; stop the scan there.
-                if d > 2 and EMAIL_RE.search(lines[j]):
+                # Another email on a line above means a different counsel
+                # block (eFile COS contact rows, stacked signature blocks).
+                # Stop before attributing this email to that block's name.
+                if d > 0 and EMAIL_RE.search(lines[j]):
                     break
                 if rep_dist is None:
                     rep = _line_matches_rep(ln_lower)
@@ -348,13 +380,46 @@ def export_csv(db_path: str, csv_path: Path = CSV_PATH) -> None:
         w.writerows(rows)
 
 
-def enrich_win(win: dict, session: requests.Session) -> list[dict]:
-    """Fetch case page, download defense briefs, harvest contacts.
+def _merge_contacts(contacts: dict[str, dict], found: list[dict]) -> None:
+    """Merge harvested contacts into contacts keyed by email lower."""
+    for c in found:
+        key = c["email"].lower()
+        if key not in contacts or (c["bar_number"] and not contacts[key]["bar_number"]):
+            contacts[key] = c
 
-    Adds win["counsel"] (possibly empty) in place; returns the contacts.
+
+def _harvest_from_briefs(briefs: list[dict], case_number: str,
+                         defense_reps: list[str],
+                         session: requests.Session,
+                         tag: str) -> dict[str, dict]:
+    """Download each brief, harvest defense contacts; return by email key."""
+    contacts: dict[str, dict] = {}
+    for brief in briefs:
+        pdf_path = download_brief(
+            brief["url"], case_number, brief["date"], session, tag=tag)
+        if pdf_path is None:
+            continue
+        text = pdf_to_text(pdf_path)
+        if not text:
+            continue
+        _merge_contacts(contacts, harvest_contacts(text, defense_reps))
+        time.sleep(0.5)
+    return contacts
+
+
+def enrich_case(case: dict, session: requests.Session) -> list[dict]:
+    """Fetch case page, download briefs, harvest defense contacts.
+
+    Mines defense-side briefs first. If no defense-counsel email is
+    found, falls back to the State's first brief (identity/list of
+    parties often lists opposing counsel with an email).
+
+    Adds case["counsel"] (possibly empty) in place; returns the contacts
+    that have an email (Parties-panel names alone are listed on counsel
+    but not returned for DB upsert).
     """
-    win.setdefault("counsel", [])
-    case_url = win.get("case_url", "")
+    case.setdefault("counsel", [])
+    case_url = case.get("case_url", "")
     if not case_url:
         return []
     resp = session.get(case_url, headers=UA, timeout=60)
@@ -362,55 +427,64 @@ def enrich_win(win: dict, session: requests.Session) -> list[dict]:
     soup = BeautifulSoup(resp.text, "html.parser")
 
     defense_reps = parse_defense_reps(soup)
-    defense_label = "Appellee" if _is_state_style(win.get("style", "")) else "Appellant"
-    briefs = parse_defense_brief_links(soup, defense_label)
-    if not briefs:
-        logger.info("Brief harvest: no %s brief on %s", defense_label, win["case_number"])
-        # Still surface the names even without a brief to mine.
-        win["counsel"] = [{"name": r, "bar_number": None, "email": None}
-                          for r in defense_reps]
-        return []
+    defense_label = "Appellee" if _is_state_style(case.get("style", "")) else "Appellant"
+    state_label = "Appellant" if defense_label == "Appellee" else "Appellee"
+    case_number = case["case_number"]
 
-    contacts: dict[str, dict] = {}
-    for brief in briefs:
-        pdf_path = download_brief(brief["url"], win["case_number"], brief["date"], session)
-        if pdf_path is None:
-            continue
-        text = pdf_to_text(pdf_path)
-        if not text:
-            continue
-        for c in harvest_contacts(text, defense_reps):
-            key = c["email"].lower()
-            if key not in contacts or (c["bar_number"] and not contacts[key]["bar_number"]):
-                contacts[key] = c
-        time.sleep(0.5)
+    defense_briefs = parse_brief_links(soup, defense_label)
+    if not defense_briefs:
+        logger.info("Brief harvest: no %s brief on %s",
+                    defense_label, case_number)
+
+    contacts = _harvest_from_briefs(
+        defense_briefs, case_number, defense_reps, session, tag="defense")
+
+    # Fallback: State briefs list defense counsel in identity-of-parties.
+    if not contacts:
+        state_briefs = parse_brief_links(soup, state_label)
+        first_state = _first_brief(state_briefs)
+        if first_state is None:
+            logger.info("Brief harvest: no %s (State) brief on %s for fallback",
+                        state_label, case_number)
+        else:
+            logger.info(
+                "Brief harvest: no defense email on %s; trying State brief of %s",
+                case_number, first_state["date"])
+            contacts = _harvest_from_briefs(
+                [first_state], case_number, defense_reps, session, tag="state")
 
     found = list(contacts.values())
     # Counsel list for the report: harvested contacts first, then any
     # remaining Parties-panel reps we found no email for.
     harvested_names = {c["name"].lower() for c in found}
-    win["counsel"] = found + [
+    case["counsel"] = found + [
         {"name": r, "bar_number": None, "email": None}
         for r in defense_reps if r.lower() not in harvested_names
     ]
     return found
 
 
-def enrich_wins(wins: list[dict], db_path: str) -> None:
-    """Enrich every win in place and persist contacts. Never raises."""
-    if not wins:
+# Backward-compatible alias used by older call sites and CLI.
+enrich_win = enrich_case
+
+
+def enrich_cases(cases: list[dict], db_path: str) -> None:
+    """Enrich every case in place and persist contacts. Never raises."""
+    if not cases:
         return
     session = requests.Session()
     total_new = 0
-    for win in wins:
+    for case in cases:
         try:
-            found = enrich_win(win, session)
+            found = enrich_case(case, session)
             if found:
-                source = f"brief:{win['case_number']} {win.get('court', '')}".strip()
+                source = (
+                    f"brief:{case['case_number']} {case.get('court', '')}"
+                ).strip()
                 total_new += upsert_contacts(db_path, found, source)
         except Exception as e:  # never let harvesting break the daily email
             logger.warning("Brief harvest: failed on %s (%s)",
-                           win.get("case_number", "?"), e)
+                           case.get("case_number", "?"), e)
         time.sleep(0.5)
     if total_new:
         try:
@@ -420,14 +494,25 @@ def enrich_wins(wins: list[dict], db_path: str) -> None:
     logger.info("Brief harvest: %d new contact(s) saved", total_new)
 
 
-def _print_win(win: dict) -> None:
-    print(f"{win['date']}  {win['court']}  {win['case_number']}  {win['disposition']}")
-    print(f"  {win['style'][:70]}")
-    for c in win.get("counsel", []):
+# Backward-compatible alias.
+enrich_wins = enrich_cases
+
+
+def _print_case(case: dict) -> None:
+    disp = case.get("disposition") or ""
+    print(f"{case.get('date', '?')}  {case.get('court', '?')}  "
+          f"{case.get('case_number', '?')}  {disp}")
+    style = case.get("style") or ""
+    if style:
+        print(f"  {style[:70]}")
+    for c in case.get("counsel", []):
         bar = c["bar_number"] or "bar# ?"
         email = c["email"] or "email ?"
         print(f"    {c['name']}  |  {bar}  |  {email}")
     print()
+
+
+_print_win = _print_case
 
 
 def main() -> int:
@@ -450,11 +535,11 @@ def main() -> int:
         wins, _state = defense_wins.collect_defense_wins(args.lookback)
         for win in wins:
             try:
-                found = enrich_win(win, session)
+                found = enrich_case(win, session)
             except Exception as e:
                 print(f"FAILED {win['case_number']}: {e}")
                 continue
-            _print_win(win)
+            _print_case(win)
             if args.save and found:
                 source = f"brief:{win['case_number']} {win.get('court', '')}".strip()
                 n = upsert_contacts(args.save, found, source)
@@ -465,15 +550,15 @@ def main() -> int:
 
     if not args.case or not args.coa:
         parser.error("--case and --coa are required unless --live")
-    win = {
+    case = {
         "date": "?", "court": f"COA{args.coa:02d}",
         "case_number": args.case,
         "style": "State v. X" if args.state_appealed else "X v. State",
         "disposition": "(manual test)",
         "case_url": f"{BASE_URL}Case.aspx?cn={args.case}&coa=coa{args.coa:02d}",
     }
-    found = enrich_win(win, session)
-    _print_win(win)
+    found = enrich_case(case, session)
+    _print_case(case)
     if args.save and found:
         n = upsert_contacts(args.save, found, f"brief:{args.case} COA{args.coa:02d}")
         export_csv(args.save)

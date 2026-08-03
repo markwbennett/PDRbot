@@ -1216,8 +1216,87 @@ class PDRBot:
     def generate_case_url(self, case_number, court):
         """Generate the online case URL"""
         base_url = "https://search.txcourts.gov/Case.aspx?cn="
-        return f"{base_url}{case_number}"
-    
+        url = f"{base_url}{case_number}"
+        if court:
+            m = re.search(r"(\d+)", str(court))
+            if m:
+                url += f"&coa=coa{int(m.group(1)):02d}"
+        return url
+
+    def _harvest_target_from_result(self, result):
+        """Build a brief_harvest case dict from a get_analysis_results row."""
+        case_number = result[0]
+        court = result[1]
+        opinion_date = result[2] if len(result) > 2 else ""
+        analysis_text = result[3] if len(result) > 3 else ""
+        stored_url = result[8] if len(result) > 8 else None
+
+        style = ""
+        data = parse_analysis_json(analysis_text)
+        if data:
+            state_app = data.get("state_is_appellant")
+            name = (data.get("appellant_name") or "").strip()
+            if state_app is True:
+                style = (
+                    f"State of Texas v. {name}" if name
+                    else "State of Texas v. Defendant"
+                )
+            else:
+                # False or unknown: ordinary defense appeal (the common case).
+                style = (
+                    f"{name} v. State of Texas" if name
+                    else "Defendant v. State of Texas"
+                )
+        else:
+            name = self.extract_appellant_name(analysis_text) or ""
+            if name:
+                style = f"{name} v. State of Texas"
+
+        case_url = (stored_url or "").strip() or self.generate_case_url(
+            case_number, court)
+        return {
+            "date": str(opinion_date) if opinion_date is not None else "",
+            "court": court or "",
+            "case_number": case_number,
+            "style": style,
+            "disposition": "",
+            "case_url": case_url,
+        }
+
+    @staticmethod
+    def _counsel_html(counsel, color="#2874a6"):
+        """Render defense-counsel lines for an HTML case card."""
+        if not counsel:
+            return ""
+        blocks = []
+        for c in counsel:
+            parts = [c["name"]]
+            if c.get("bar_number"):
+                parts.append(f"SBOT {c['bar_number']}")
+            if c.get("email"):
+                parts.append(
+                    f'<a href="mailto:{c["email"]}" '
+                    f'style="color:{color};">{c["email"]}</a>')
+            blocks.append(
+                f'<div style="margin-top:2px;font-size:12px;color:#333;">'
+                f'&#9878;&#65039; {" &middot; ".join(parts)}</div>')
+        return "".join(blocks)
+
+    @staticmethod
+    def _counsel_plain_lines(counsel, label="Defense counsel"):
+        """Plain-text counsel lines for the text/plain email body."""
+        if not counsel:
+            return ""
+        lines = []
+        for c in counsel:
+            bits = [c["name"]]
+            if c.get("bar_number"):
+                bits.append(f"SBOT {c['bar_number']}")
+            if c.get("email"):
+                bits.append(c["email"])
+            lines.append(f"    {label}: {' -- '.join(bits)}\n")
+        return "".join(lines)
+
     def scrape_case_representatives(self, case_url, case_number, court, opinion_date):
         """Scrape representative information from case URL"""
         try:
@@ -2263,12 +2342,16 @@ class PDRBot:
             logger.error(f"Error generating prompt PDF: {e}")
             return None
 
-    def _build_email_html(self, target_date, results, interesting_count, wins=None):
+    def _build_email_html(self, target_date, results, interesting_count,
+                          wins=None, counsel_by_case=None):
         """Build HTML email body with case cards and direct links.
 
         wins: list of defense-win dicts from defense_wins.collect_defense_wins(),
-        rendered as a green section at the top of the email."""
+        rendered as a green section at the top of the email.
+        counsel_by_case: case_number -> list of counsel dicts for interesting cases.
+        """
         wins = wins or []
+        counsel_by_case = counsel_by_case or {}
         # Build case cards
         case_cards_html = ""
         if interesting_count > 0:
@@ -2314,6 +2397,9 @@ class PDRBot:
                     issue_word = "issue" if issue_count == 1 else "issues"
                     headlines_html = f"<p style='margin:6px 0 0 0;color:#555;'>{issue_count} {issue_word}</p>"
 
+                counsel_html = self._counsel_html(
+                    counsel_by_case.get(case_number, []), color="#2874a6")
+
                 # Direct PDF link if available
                 link_html = f'<a href="{case_url}" style="color:#2874a6;text-decoration:none;">Case page</a>'
                 if pdf_url and pdf_url.strip():
@@ -2326,6 +2412,7 @@ class PDRBot:
                         {case_label} <span style="font-weight:normal;color:#666;">({court})</span>{score_badge}
                     </div>
                     {headlines_html}
+                    {counsel_html}
                     <div style="margin-top:4px;font-size:12px;">{link_html}</div>
                 </td></tr>"""
 
@@ -2342,18 +2429,8 @@ class PDRBot:
                         f' &middot; <a href="{w["pdf_url"]}" '
                         f'style="color:#1e8449;text-decoration:none;">Opinion PDF</a>'
                     )
-                counsel_html = ""
-                for c in w.get("counsel", []):
-                    parts = [c["name"]]
-                    if c.get("bar_number"):
-                        parts.append(f"SBOT {c['bar_number']}")
-                    if c.get("email"):
-                        parts.append(
-                            f'<a href="mailto:{c["email"]}" '
-                            f'style="color:#1e8449;">{c["email"]}</a>')
-                    counsel_html += (
-                        f'<div style="margin-top:2px;font-size:12px;color:#333;">'
-                        f'&#9878;&#65039; {" &middot; ".join(parts)}</div>')
+                counsel_html = self._counsel_html(
+                    w.get("counsel", []), color="#1e8449")
                 win_cards += f'''
                 <tr><td style="padding:10px 16px;border-bottom:1px solid #d5e8d4;background:#f4faf4;">
                     <div style="font-size:15px;font-weight:bold;color:#145a32;">{w['style']}</div>
@@ -2409,9 +2486,11 @@ class PDRBot:
 </body></html>"""
         return html
 
-    def _build_email_plain(self, target_date, results, interesting_count, wins=None):
+    def _build_email_plain(self, target_date, results, interesting_count,
+                           wins=None, counsel_by_case=None):
         """Build plain-text fallback email body."""
         wins = wins or []
+        counsel_by_case = counsel_by_case or {}
         if wins:
             wins_section = "DEFENSE WINS\n\n"
             for w in wins:
@@ -2419,13 +2498,8 @@ class PDRBot:
                     f"  {w['style']}\n"
                     f"    {w['case_number']} ({w['court']}, {w['date']}) -- {w['disposition']}\n"
                 )
-                for c in w.get("counsel", []):
-                    bits = [c["name"]]
-                    if c.get("bar_number"):
-                        bits.append(f"SBOT {c['bar_number']}")
-                    if c.get("email"):
-                        bits.append(c["email"])
-                    wins_section += f"    Winning counsel: {' -- '.join(bits)}\n"
+                wins_section += self._counsel_plain_lines(
+                    w.get("counsel", []), label="Defense counsel")
                 wins_section += f"    {w['case_url']}\n\n"
         else:
             wins_section = "No new defense wins on the COA dockets.\n\n"
@@ -2452,6 +2526,9 @@ class PDRBot:
                 else:
                     issue_word = "issue" if issue_count == 1 else "issues"
                     cases_section += f"  {case_label}{score_str} -- {issue_count} {issue_word}\n"
+                cases_section += self._counsel_plain_lines(
+                    counsel_by_case.get(case_number, []),
+                    label="Defense counsel")
                 cases_section += "\n"
         else:
             cases_section = "No interesting issues were identified."
@@ -2511,10 +2588,30 @@ To unsubscribe, reply with 'unsubscribe' in the subject or body.
             except Exception as exc:
                 logger.warning(f"Defense-wins docket check failed: {exc}")
                 wins, wins_state = [], None
-            # Harvest winning counsel's name/bar number/email from their
-            # briefs; adds win["counsel"] in place and upserts into the
-            # lawyer_contacts table. Never raises.
-            brief_harvest.enrich_wins(wins, self.db_path)
+
+        # Harvest defense counsel (name / SBOT / email) from briefs for every
+        # case on this report — defense wins and interesting opinions alike —
+        # so the listing is outreach-ready. Never raises.
+        win_case_numbers = {w["case_number"] for w in wins}
+        harvest_targets = list(wins)
+        for result in results:
+            target = self._harvest_target_from_result(result)
+            if target["case_number"] not in win_case_numbers:
+                harvest_targets.append(target)
+        # Re-enrich wins that arrived already enriched from run_daily_automation
+        # only when counsel is missing; otherwise still fill interesting cases.
+        needs_enrich = [
+            t for t in harvest_targets
+            if not t.get("counsel")
+        ]
+        if needs_enrich:
+            brief_harvest.enrich_cases(needs_enrich, self.db_path)
+        counsel_by_case = {
+            t["case_number"]: t.get("counsel", []) for t in harvest_targets
+        }
+        for w in wins:
+            if not w.get("counsel"):
+                w["counsel"] = counsel_by_case.get(w["case_number"], [])
 
         # Subject line: show count + up to three top headlines.
         if interesting_count == 0:
@@ -2543,8 +2640,12 @@ To unsubscribe, reply with 'unsubscribe' in the subject or body.
             subject = f"{len(wins)} defense win{'s' if len(wins) != 1 else ''}\u2014{subject}"
 
         # Build email content
-        html_body = self._build_email_html(target_date, results, interesting_count, wins=wins)
-        plain_body = self._build_email_plain(target_date, results, interesting_count, wins=wins)
+        html_body = self._build_email_html(
+            target_date, results, interesting_count,
+            wins=wins, counsel_by_case=counsel_by_case)
+        plain_body = self._build_email_plain(
+            target_date, results, interesting_count,
+            wins=wins, counsel_by_case=counsel_by_case)
 
         # Read report attachment once (may be absent if PDF generation failed).
         report_data = None
@@ -2927,10 +3028,8 @@ To unsubscribe, reply with 'unsubscribe' in the subject or body.
             except Exception as exc:
                 logger.warning(f"Defense-wins docket check failed: {exc}")
                 wins, wins_state = [], None
-            # Harvest winning counsel's name/bar number/email from their
-            # briefs; adds win["counsel"] in place and upserts into the
-            # lawyer_contacts table. Never raises.
-            brief_harvest.enrich_wins(wins, self.db_path)
+            # Defense-counsel harvest for wins + interesting cases runs inside
+            # send_email_report (where both sets of cases are available).
 
             if not report_path and report_generation_error is None and not wins:
                 # Genuine no-cases state — no interesting opinions AND no new
