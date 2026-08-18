@@ -18,8 +18,9 @@ or any other case dict with a case_url), this module:
      panel -- prosecutor/State service addresses drop out the same way.
   5. If no defense-counsel email is found (no defense brief, or the
      brief lacks an email), downloads the State's first brief and mines
-     it the same way. The State's automated Certificate of eService is
-     treated as a source of truth for who was served (defense counsel).
+     it the same way. TAMES often labels that filing "State" (not
+     Appellee/Appellant). The State's automated Certificate of eService
+     is treated as a source of truth for who was served (defense counsel).
   6. Upserts the contacts into the lawyer_contacts table in pdrbot.db
      and refreshes data/lawyer_contacts.csv.
 
@@ -122,14 +123,24 @@ def parse_defense_reps(soup: BeautifulSoup) -> list[str]:
     return reps
 
 
-def parse_brief_links(soup: BeautifulSoup, filed_by_label: str) -> list[dict]:
-    """Brief PDF links filed by the given side.
+def parse_brief_links(soup: BeautifulSoup,
+                      filed_by_labels: str | list[str]) -> list[dict]:
+    """Brief PDF links filed by the given side(s).
 
-    filed_by_label: "Appellant" or "Appellee". Rows in the Appellate
-    Briefs panel carry a filed-by cell; nested media rows (which repeat
-    the links without a date) are skipped by requiring a date cell.
-    Returned in table order (TAMES chronological ascending).
+    filed_by_labels: "Appellant", "Appellee", "State", or a list of those.
+    Rows in the Appellate Briefs panel carry a filed-by cell; nested media
+    rows (which repeat the links without a date) are skipped by requiring
+    a date cell. Returned in table order (TAMES chronological ascending).
+
+    TAMES often labels the prosecution's brief as "State" rather than
+    "Appellee"/"Appellant", so State-side callers should pass both the
+    role label and "State".
     """
+    if isinstance(filed_by_labels, str):
+        filed_by_labels = [filed_by_labels]
+    labels = [lab.lower() for lab in filed_by_labels if lab]
+    if not labels:
+        return []
     table = _panel_table(soup, "Appellate Briefs")
     if table is None:
         return []
@@ -141,7 +152,8 @@ def parse_brief_links(soup: BeautifulSoup, filed_by_label: str) -> list[dict]:
         if not texts or not re.match(r"\d{2}/\d{2}/\d{4}", texts[0]):
             continue  # nested media sub-row, not a filing row
         filed_by = texts[2] if len(texts) > 2 else ""
-        if filed_by_label.lower() not in filed_by.lower():
+        filed_by_lower = filed_by.lower()
+        if not any(lab in filed_by_lower for lab in labels):
             continue
         for a in row.find_all("a"):
             href = a.get("href", "")
@@ -256,11 +268,27 @@ def harvest_contacts(text: str, defense_reps: list[str]) -> list[dict]:
         surname = tokens[-1] if tokens else ""
         rep_matchers.append((rep, _norm(rep), _norm(surname)))
 
+    def _surname_in_line(surname: str, line_lower: str) -> bool:
+        """True if surname appears as its own word or glued to a short prefix.
+
+        eFileTexas automated COS rows sometimes drop the space/period after a
+        middle initial, so "Matthew J. Smid" becomes "Matthew JSmid". A plain
+        \\b surname match fails on "jsmid"; treat a 1–2 letter alphabetic
+        prefix before the surname as that glued initial.
+        """
+        if len(surname) <= 3:
+            return False
+        if re.search(r"\b" + re.escape(surname) + r"\b", line_lower):
+            return True
+        for token in re.findall(r"[a-z]+", line_lower):
+            if (token.endswith(surname)
+                    and 1 <= len(token) - len(surname) <= 2):
+                return True
+        return False
+
     def _line_matches_rep(line_lower: str):
         for rep, rep_lower, surname in rep_matchers:
-            if rep_lower in line_lower or (
-                    len(surname) > 3 and re.search(
-                        r"\b" + re.escape(surname) + r"\b", line_lower)):
+            if rep_lower in line_lower or _surname_in_line(surname, line_lower):
                 return rep
         return None
 
@@ -439,17 +467,20 @@ def enrich_case(case: dict, session: requests.Session) -> list[dict]:
     contacts = _harvest_from_briefs(
         defense_briefs, case_number, defense_reps, session, tag="defense")
 
-    # Fallback: State briefs list defense counsel in identity-of-parties.
+    # Fallback: State briefs list defense counsel in identity-of-parties /
+    # Certificate of Service. TAMES often labels that filing "State" rather
+    # than Appellee/Appellant (e.g. 02-26-00218-CR).
     if not contacts:
-        state_briefs = parse_brief_links(soup, state_label)
+        state_briefs = parse_brief_links(soup, [state_label, "State"])
         first_state = _first_brief(state_briefs)
         if first_state is None:
-            logger.info("Brief harvest: no %s (State) brief on %s for fallback",
+            logger.info("Brief harvest: no %s/State brief on %s for fallback",
                         state_label, case_number)
         else:
             logger.info(
-                "Brief harvest: no defense email on %s; trying State brief of %s",
-                case_number, first_state["date"])
+                "Brief harvest: no defense email on %s; trying State brief of %s "
+                "(filed_by=%s)",
+                case_number, first_state["date"], first_state.get("filed_by"))
             contacts = _harvest_from_briefs(
                 [first_state], case_number, defense_reps, session, tag="state")
 
